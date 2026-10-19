@@ -2,3 +2,4 @@
 # keeps LF wherever it is checked out -- and the Windows one keeps CRLF.
 *.sh  text eol=lf
 *.cmd text eol=crlf
+*.bat text eol=crlf

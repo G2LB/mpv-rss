@@ -43,6 +43,11 @@ item and twice as many fit on screen.
 
 Nothing else. The XML parser, the JSON handling and the UI are all in `rss.lua`.
 
+Install commands per package manager — winget, Homebrew, pacman, apt, dnf — and
+what exactly stops working if you skip an optional one, are in
+**[DEPENDENCIES.md](DEPENDENCIES.md)**. On Windows, **`install-deps.bat`** does
+the winget half for you and skips whatever is already there.
+
 ### Which platforms
 
 | | |
@@ -125,7 +130,8 @@ See [§8](#8-configuration).
 
 ### 2.4 Install yt-dlp
 
-Needed only to play YouTube videos.
+Needed only to play YouTube videos. On Windows, `install-deps.bat` covers this
+step and the next one.
 
 | | |
 |---|---|
