@@ -1,12 +1,17 @@
 -- rss.lua -- RSS/Atom + YouTube subscription browser inside mpv's own OSD.
 --
--- Install:  %APPDATA%\mpv\scripts\rss.lua
--- Options:  %APPDATA%\mpv\script-opts\rss.conf   (see README.md)
--- Data:     %APPDATA%\mpv\rss-feeds.json / rss-state.json / rss-cache.json
+-- Runs on Windows, Linux, macOS and the BSDs. Paths below are mpv's own config
+-- directory, so they read %APPDATA%\mpv on Windows and ~/.config/mpv elsewhere:
 --
--- Dependencies: none beyond mpv itself. HTTP goes through curl.exe (shipped with
--- Windows 10 1803+) with a PowerShell fallback; YouTube playback is handled by
--- mpv's built-in ytdl_hook + yt-dlp.
+-- Install:  <mpv config dir>/scripts/rss.lua
+-- Options:  <mpv config dir>/script-opts/rss.conf   (see README.md)
+-- Data:     <mpv config dir>/rss-feeds.json / rss-state.json / rss-cache.json
+--
+-- Dependencies: none beyond mpv itself. HTTP goes through curl (shipped with
+-- Windows 10 1803+ and with every current Linux and macOS), falling back to
+-- PowerShell on Windows and to wget elsewhere; YouTube playback is handled by
+-- mpv's built-in ytdl_hook + yt-dlp. Everything else that differs per OS is
+-- resolved in section 2 under PLATFORM and nowhere else.
 --
 -- Default key: ctrl+r opens the browser.
 
@@ -32,9 +37,11 @@ local opts = {
     key_index     = "i",  -- show the playlist               (mpv default: stats)
     key_edit      = "alt+a", -- open rss-feeds.json in an editor
 
-    -- Command used by key_edit. "auto" opens nvim in Windows Terminal and falls
-    -- back to a plain console window. Give a full command to override, e.g.
-    --   editor=code
+    -- Command used by key_edit. "auto" picks per platform: nvim in Windows
+    -- Terminal, "open -t" on macOS, or $VISUAL/$EDITOR inside whichever
+    -- terminal emulator is installed on Linux and the BSDs. Give a full
+    -- command to override -- the file path is appended, or put {} where it
+    -- should go:  editor=code -w   editor=kitty nvim   editor=gedit
     editor = "auto",
 
     -- refresh
@@ -142,7 +149,8 @@ local opts = {
     thumbnail_aspect = 1.78,
 
     -- http
-    http_backend = "auto",  -- auto | curl | powershell
+    -- auto picks curl, then PowerShell on Windows / wget everywhere else
+    http_backend = "auto",  -- auto | curl | wget | powershell
     http_timeout = 20,      -- seconds per feed
 
     -- paths (empty = <mpv config dir>/rss-*.json)
@@ -161,6 +169,58 @@ local UA = "mpv-rss/1.0"
 --==========================================================================
 -- 2. SMALL UTILITIES
 --==========================================================================
+
+-- PLATFORM ---------------------------------------------------------------
+-- Nothing in this script is Windows-only, but several things are not pure Lua
+-- either -- the scratch directory, the HTTP helper, the font list, the editor
+-- -- and each of those is spelled differently per OS. Every one of those
+-- differences is decided here, so the rest of the file stays platform-blind.
+--
+-- One table rather than a local apiece, deliberately: the main chunk is near
+-- LuaJIT's ceiling of 200 locals per function, and mpv builds against LuaJIT.
+
+local PLAT = {}
+
+-- mpv 0.36+ reports it: windows | darwin | linux | android | freebsd | ...
+PLAT.name = (function()
+    local p = mp.get_property("platform")
+    if type(p) == "string" and p ~= "" then return p end
+    -- Older mpv: the directory separator Lua itself was built with says enough.
+    if package.config:sub(1, 1) == "\\" then return "windows" end
+    return "linux"
+end)()
+
+PLAT.windows = PLAT.name == "windows"
+PLAT.mac     = PLAT.name == "darwin"
+
+-- Windows ships curl as curl.exe; asking for it by that name also keeps the
+-- PowerShell alias (where "curl" means Invoke-WebRequest) out of the picture.
+PLAT.curl = PLAT.windows and "curl.exe" or "curl"
+
+-- Writable scratch space for the URL hand-off files, downloaded pictures and
+-- converted thumbnails. TEMP on Windows, TMPDIR (or /tmp) on everything else.
+function PLAT.temp_dir()
+    if PLAT.windows then
+        return os.getenv("TEMP") or os.getenv("TMP") or "."
+    end
+    local dir = os.getenv("TMPDIR")
+    if dir and dir ~= "" then return (dir:gsub("[/\\]+$", "")) end
+    return "/tmp"
+end
+
+-- Split a configured command ("code -w", "kitty nvim") into argv. Whitespace
+-- is the only separator -- there is no quoting -- which is why a path is never
+-- part of the string: it is appended, or substituted for a {} placeholder.
+function PLAT.split_command(s, path)
+    local argv = {}
+    for word in tostring(s or ""):gmatch("%S+") do
+        argv[#argv + 1] = (word == "{}") and path or word
+    end
+    if #argv == 0 then return nil end
+    for _, a in ipairs(argv) do if a == path then return argv end end
+    argv[#argv + 1] = path
+    return argv
+end
 
 local function trim(s)
     if type(s) ~= "string" then return s end
@@ -294,7 +354,7 @@ local function write_json(path, tbl)
 end
 
 local function temp_path(suffix)
-    local dir = os.getenv("TEMP") or os.getenv("TMP") or "."
+    local dir = PLAT.temp_dir()
     local name = string.format("mpv-rss-%d-%d%s",
         os.time(), math.random(100000, 999999), suffix)
     return utils.join_path(dir, name)
@@ -371,8 +431,9 @@ end
 -- process whenever playback is not active -- i.e. exactly the idle state this
 -- browser normally runs in. Every call below must pass playback_only=false.
 
-local http_backend = nil        -- "curl" | "powershell", resolved once
+local http_backend = nil        -- "curl" | "wget" | "powershell", resolved once
 local http_pending = {}         -- requests queued until the probe finishes
+
 
 local function run_async(args, cb)
     mp.command_native_async({
@@ -397,7 +458,7 @@ end
 -- than the guess. Cap the handshake instead, and give up only once the
 -- transfer has actually stalled.
 local function curl_args(url, outfile, media)
-    local args = { "curl.exe", "-sS", "-L", "--fail" }
+    local args = { PLAT.curl, "-sS", "-L", "--fail" }
     local function add(...) for _, a in ipairs({ ... }) do args[#args + 1] = a end end
     if media then
         add("--connect-timeout", "30", "--speed-time", "30", "--speed-limit", "1024")
@@ -428,6 +489,33 @@ local function powershell_args(url, outfile, urlfile, media)
     }
 end
 
+-- The one place a backend becomes a command line. Returns argv plus, for the
+-- PowerShell backend only, the temp file the URL was handed over in -- which
+-- the caller deletes once the child has exited. A third return is an error.
+local function transfer_args(url, outfile, media)
+    if http_backend == "curl" then
+        return curl_args(url, outfile, media), nil
+    elseif http_backend == "wget" then
+        -- The fallback on Linux and the BSDs, for the minimal install with no
+        -- curl. wget's --timeout is per operation rather than a budget for the
+        -- whole transfer, which is what an episode wants anyway; a feed is
+        -- small enough that per-operation and overall come to the same thing.
+        return {
+            "wget", "--quiet", "--user-agent=" .. UA,
+            "--timeout=" .. tostring(media and 30 or math.floor(opts.http_timeout)),
+            "--tries=" .. (media and "2" or "1"),
+            "-O", outfile, "--", url,
+        }, nil
+    end
+    local urlfile = temp_path(".url")
+    local ok, err = file_write(urlfile, url)
+    if not ok then
+        os.remove(urlfile)
+        return nil, nil, "could not write temp file: " .. tostring(err)
+    end
+    return powershell_args(url, outfile, urlfile, media), urlfile
+end
+
 -- download(url, outfile, cb, media) -> cb(ok, errmsg); the file is left on
 -- disk. Set media for a podcast episode, so it is not held to the per-feed
 -- timeout -- see curl_args.
@@ -441,16 +529,8 @@ local function download(url, outfile, cb, media)
             { url = url, outfile = outfile, cb = cb, media = media }
         return
     end
-    local urlfile = nil
-    local args
-    if http_backend == "curl" then
-        args = curl_args(url, outfile, media)
-    else
-        urlfile = temp_path(".url")
-        local ok, err = file_write(urlfile, url)
-        if not ok then cb(false, "could not write temp file: " .. tostring(err)) return end
-        args = powershell_args(url, outfile, urlfile, media)
-    end
+    local args, urlfile, argerr = transfer_args(url, outfile, media)
+    if not args then cb(false, argerr) return end
     run_async(args, function(success, res, err)
         if urlfile then os.remove(urlfile) end
         if not success then
@@ -459,7 +539,13 @@ local function download(url, outfile, cb, media)
         end
         local status = res and res.status or -1
         if status ~= 0 then
-            cb(false, first_line(res and res.stderr) or ("exit code " .. tostring(status)))
+            -- A negative status is mpv failing to start the child at all,
+            -- which on a fresh box means the program is not installed -- so
+            -- say that rather than printing a number nobody can act on.
+            cb(false, first_line(res and res.stderr)
+                or (status < 0
+                    and (http_backend .. " could not be run -- is it installed?")
+                    or ("exit code " .. tostring(status))))
             return
         end
         cb(true, nil)
@@ -478,16 +564,8 @@ local function fetch(url, cb)
     end
 
     local outfile = temp_path(".xml")
-    local urlfile = nil
-    local args
-    if http_backend == "curl" then
-        args = curl_args(url, outfile)
-    else
-        urlfile = temp_path(".url")
-        local ok, err = file_write(urlfile, url)
-        if not ok then cb(nil, "could not write temp file: " .. tostring(err)) return end
-        args = powershell_args(url, outfile, urlfile)
-    end
+    local args, urlfile, argerr = transfer_args(url, outfile)
+    if not args then cb(nil, argerr) return end
 
     run_async(args, function(success, res, err)
         local body = file_read(outfile)
@@ -500,7 +578,11 @@ local function fetch(url, cb)
         end
         local status = res and res.status or -1
         if status ~= 0 then
-            local detail = first_line(res and res.stderr) or ("exit code " .. tostring(status))
+            -- see download(): a negative status means it never started
+            local detail = first_line(res and res.stderr)
+                or (status < 0
+                    and (http_backend .. " could not be run -- is it installed?")
+                    or ("exit code " .. tostring(status)))
             cb(nil, detail)
             return
         end
@@ -524,12 +606,24 @@ local function probe_http_backend()
         end
     end
 
-    if opts.http_backend == "curl" or opts.http_backend == "powershell" then
-        settle(opts.http_backend)
+    -- No curl: PowerShell is always there on Windows, wget is the one thing a
+    -- Linux or BSD box without curl almost certainly does have. macOS has curl
+    -- in the base system, so the fallback there is only ever a formality.
+    local fallback = PLAT.windows and "powershell" or "wget"
+
+    if opts.http_backend == "curl" or opts.http_backend == "wget"
+            or opts.http_backend == "powershell" then
+        if opts.http_backend == "powershell" and not PLAT.windows then
+            msg.warn("http_backend=powershell on " .. PLAT.name
+                .. "; falling back to " .. fallback)
+            settle(fallback)
+        else
+            settle(opts.http_backend)
+        end
         return
     end
-    run_async({ "curl.exe", "--version" }, function(success, res)
-        if success and res and res.status == 0 then settle("curl") else settle("powershell") end
+    run_async({ PLAT.curl, "--version" }, function(success, res)
+        if success and res and res.status == 0 then settle("curl") else settle(fallback) end
     end)
 end
 
@@ -1636,13 +1730,23 @@ local ICON_SETS = {
 local ICON = ICON_SETS.ascii      -- upgraded by probe_font() if one is present
 local UI_FONT = ""                -- resolved font family, "" = mpv OSD default
 
+-- The same font is registered under different family names per platform: the
+-- Windows installer shortens "Nerd Font" to "NF", while fontconfig on Linux
+-- and macOS keeps it spelled out. Both spellings are listed, and the one that
+-- matches is also the one handed to ASS -- so the name is always the local one.
+-- No entry is a substring of another, so a hit is never the wrong family.
 local NERD_CANDIDATES = {
     "JetBrainsMono NF", "JetBrainsMono NFM", "FiraCode NF",
-    "CaskaydiaCove NF", "Hack NF", "Symbols Nerd Font",
+    "CaskaydiaCove NF", "Hack NF",
+    "JetBrainsMono Nerd Font", "FiraCode Nerd Font",
+    "CaskaydiaCove Nerd Font", "Hack Nerd Font",
+    "Symbols Nerd Font",
 }
 
--- mpv cannot enumerate fonts, so ask Windows once at startup. Async, and the
--- interface renders with ASCII icons until the answer arrives.
+-- mpv cannot enumerate fonts, so ask the OS once at startup. Each platform has
+-- its own way of being asked, and more than one is worth trying on macOS, so
+-- this is a list of commands attempted in order until one answers. Async, and
+-- the interface renders with ASCII icons until the answer arrives.
 local function probe_font()
     if opts.icons == "ascii" then return end
     if opts.icons == "nerd" then
@@ -1650,14 +1754,36 @@ local function probe_font()
         UI_FONT = (opts.font ~= "") and opts.font or NERD_CANDIDATES[1]
         return
     end
-    run_async({ "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-        "Add-Type -AssemblyName System.Drawing; "
-        .. "(New-Object System.Drawing.Text.InstalledFontCollection).Families"
-        .. " | ForEach-Object { $_.Name }" },
-        function(ok, res)
+
+    local cmds
+    if PLAT.windows then
+        cmds = { { "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+            "Add-Type -AssemblyName System.Drawing; "
+            .. "(New-Object System.Drawing.Text.InstalledFontCollection).Families"
+            .. " | ForEach-Object { $_.Name }" } }
+    else
+        -- fontconfig: standard on Linux and the BSDs, and on a macOS that has
+        -- it from Homebrew or MacPorts.
+        cmds = { { "fc-list", ":", "family" } }
+        if PLAT.mac then
+            -- Stock macOS has no fontconfig. system_profiler does print real
+            -- family names ("Full Name: JetBrainsMono NF Regular"), it is just
+            -- slow -- a few seconds -- which is why it comes second, and why
+            -- this probe is async: the interface is already up on ASCII icons.
+            cmds[#cmds + 1] =
+                { "system_profiler", "-detailLevel", "mini", "SPFontsDataType" }
+        end
+    end
+    local function try(i)
+        if i > #cmds then
+            msg.verbose("could not enumerate fonts; keeping ASCII icons."
+                .. " Set icons=nerd (and font=<family>) to force them on")
+            return
+        end
+        run_async(cmds[i], function(ok, res)
             local out = (ok and res and res.status == 0) and res.stdout or nil
-            if type(out) ~= "string" then
-                msg.verbose("could not enumerate fonts; keeping ASCII icons")
+            if type(out) ~= "string" or out == "" then
+                try(i + 1)
                 return
             end
             for _, want in ipairs(NERD_CANDIDATES) do
@@ -1670,6 +1796,8 @@ local function probe_font()
             end
             msg.verbose("no Nerd Font installed; using ASCII icons")
         end)
+    end
+    try(1)
 end
 
 --==========================================================================
@@ -1839,7 +1967,7 @@ end
 -- Keyed by both dimensions: a file converted for a different slot is a
 -- different file, and this retires earlier generations of the cache for free.
 local function thumb_cache_file(url, w, h)
-    return utils.join_path(os.getenv("TEMP") or ".",
+    return utils.join_path(PLAT.temp_dir(),
         -- the "c" marks the cropped-to-fill generation, so files padded by an
         -- earlier version are never picked up: they are the same size in bytes
         string.format("mpv-rss-th-%s-%dx%dc.bgra", fnv1a(url), w, h))
@@ -1955,7 +2083,7 @@ local function prepare_thumb(url)
     -- The downloaded picture is kept, not just the converted one: resizing the
     -- window asks for a new pixel size, and re-fetching the image over the
     -- network for every size the drag passes through would be absurd.
-    local src = utils.join_path(os.getenv("TEMP") or ".",
+    local src = utils.join_path(PLAT.temp_dir(),
         string.format("mpv-rss-img-%s", fnv1a(url)))
     if (file_size(src) or 0) > 0 then
         convert(src)
@@ -2703,7 +2831,11 @@ local ytdl_available = nil   -- nil = unknown, false = missing, string = program
 local last_played = nil
 
 local function probe_ytdl()
-    local candidates = { "yt-dlp", "yt-dlp.exe", "youtube-dl" }
+    -- "yt-dlp" covers a package manager install everywhere; the second name is
+    -- what the standalone binary from the release page is called on each OS.
+    local second = PLAT.windows and "yt-dlp.exe"
+        or (PLAT.mac and "yt-dlp_macos" or "yt-dlp_linux")
+    local candidates = { "yt-dlp", second, "youtube-dl" }
     local function try(i)
         if i > #candidates then
             ytdl_available = false
@@ -3265,14 +3397,86 @@ local function open_feeds_in_editor()
         end)
     end
 
+    -- editor=auto is a list of candidates per platform, tried in order until
+    -- one of them exits cleanly: a terminal with an editor in it first, and the
+    -- platform's own "just open this file" command as the last resort, which
+    -- always works but lands in whatever GUI editor is registered.
+    local function auto_commands(ed)
+        if PLAT.windows then
+            return {
+                { "wt.exe", "nvim", path },                      -- Windows Terminal
+                { "cmd.exe", "/c", "start", "", "nvim", path },   -- plain console
+            }
+        end
+        if PLAT.mac then
+            -- A terminal on macOS means AppleScript and quoting a path into
+            -- it; "open -t" hands the file to the registered text editor and
+            -- is the honest trade for not doing that.
+            return { { "open", "-t", path } }
+        end
+        return {
+            { "x-terminal-emulator", "-e", ed, path },  -- Debian/Ubuntu alternative
+            { "kitty", ed, path },
+            { "alacritty", "-e", ed, path },
+            { "wezterm", "start", "--", ed, path },
+            { "foot", ed, path },
+            { "gnome-terminal", "--", ed, path },
+            { "konsole", "-e", ed, path },
+            { "xterm", "-e", ed, path },
+            { "xdg-open", path },                       -- gives up and uses the GUI
+        }
+    end
+
+    -- Each candidate is tried until one exits cleanly: a terminal with an
+    -- editor in it first, and the platform's own "just open this file" command
+    -- last, which always works but lands in whatever GUI editor is registered.
+    local function run_chain(cmds)
+        local function try(i)
+            if i > #cmds then
+                msg.warn("no editor could be launched; set editor= in rss.conf")
+                return
+            end
+            launch(cmds[i], function()
+                msg.verbose(cmds[i][1] .. " unavailable, trying the next editor")
+                try(i + 1)
+            end)
+        end
+        try(1)
+    end
+
     if opts.editor ~= "" and opts.editor ~= "auto" then
-        launch({ opts.editor, path })
+        launch(PLAT.split_command(opts.editor, path) or { opts.editor, path })
+    elseif PLAT.windows or PLAT.mac then
+        run_chain(auto_commands())
     else
-        -- Windows Terminal first; if it is not there, a plain console window
-        launch({ "wt.exe", "nvim", path }, function()
-            msg.verbose("wt.exe unavailable, falling back to a console window")
-            launch({ "cmd.exe", "/c", "start", "", "nvim", path })
-        end)
+        -- $VISUAL / $EDITOR is the user's own answer to this question, and it is
+        -- a TUI editor in the overwhelming majority of cases -- hence a terminal
+        -- around it rather than a bare exec with no tty to draw on.
+        local ed = os.getenv("VISUAL")
+        if not ed or ed == "" then ed = os.getenv("EDITOR") end
+        if ed and ed ~= "" then
+            run_chain(auto_commands(ed))
+        else
+            -- Neither is set. Guessing nvim would open a terminal that closes
+            -- again on a box that only has vim or nano -- and that reads as
+            -- "the key does nothing" -- so ask which one is actually there.
+            -- vi is the last resort because POSIX requires it.
+            local editors = { "nvim", "vim", "nano", "vi" }
+            local function pick(i)
+                if i >= #editors then
+                    run_chain(auto_commands(editors[#editors]))
+                    return
+                end
+                run_async({ editors[i], "--version" }, function(ok, res)
+                    if ok and res and res.status == 0 then
+                        run_chain(auto_commands(editors[i]))
+                    else
+                        pick(i + 1)
+                    end
+                end)
+            end
+            pick(1)
+        end
     end
     status("RSS: editing rss-feeds.json — save in the editor and it reloads here", 8)
     watch_feeds_file()
@@ -3880,7 +4084,10 @@ local function debug_parse(target)
     if target:match("^https?://") then
         fetch(target, report)
     else
-        local path = target:gsub("^file:///", ""):gsub("^file://", "")
+        -- file:///C:/x on Windows gives up all three slashes; file:///home/x
+        -- has to keep the one that makes the Unix path absolute
+        local path = target:gsub("^file://", "")
+        if PLAT.windows then path = path:gsub("^/", "") end
         local body = file_read(path)
         if not body then
             msg.error("debug_parse: cannot read " .. path)

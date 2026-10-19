@@ -9,7 +9,7 @@ Ctrl+R  →  Subscriptions  →  Latest videos  →  Enter  →  mpv plays the v
 ```
 
 No separate application, no web UI, no Electron, no Python or Node. One Lua
-file and mpv.
+file and mpv, on Windows, Linux, macOS and the BSDs.
 
 ```
 ┌──────────────────────────────────────────────────────────────┬─────────┐
@@ -35,91 +35,134 @@ item and twice as many fit on screen.
 
 | | |
 |---|---|
-| mpv | any current build. Developed and tested against **v0.41.0** on Windows 11 |
+| mpv | any current build. Developed and tested against **v0.41.0** |
 | yt-dlp | only for YouTube playback — ordinary RSS feeds work without it |
-| HTTP | `curl.exe` (ships with Windows 10 1803+) or PowerShell — whichever exists |
+| HTTP | `curl` — it ships with Windows 10 1803+, with every current Linux, and with macOS. Where it is missing: PowerShell on Windows, `wget` elsewhere |
+| ffmpeg | thumbnails only. Without it they are simply off and nothing else changes |
+| fontconfig | icon auto-detection outside Windows (`fc-list`). Optional, and macOS has a second route; without either the icons stay ASCII unless you set `icons=nerd` |
 
 Nothing else. The XML parser, the JSON handling and the UI are all in `rss.lua`.
+
+### Which platforms
+
+| | |
+|---|---|
+| **Windows** 10 / 11 | supported |
+| **Linux**, **FreeBSD**, **OpenBSD** | supported |
+| **macOS** | supported |
+| **Android** | untested. Whether an mpv-android build exposes Lua scripts and `subprocess` varies; where it does, the Linux behaviour applies |
+| **iOS / iPadOS** | not possible — see below |
+
+The script asks mpv for its `platform` at startup and everything that is not
+pure Lua — the scratch directory, the HTTP command, the font list, the editor —
+follows from that one answer. There is no separate Windows and Unix version.
+
+Day-to-day development happens on Windows 11. The Linux and macOS branches were
+checked by forcing the platform and reading back every command the script then
+builds — `curl`, `wget --timeout=… -O /tmp/…`, `fc-list : family`,
+`system_profiler`, `yt-dlp` — so the commands and paths are verified, but the
+full interface has not yet been driven on a Linux or macOS desktop. Bug reports
+from one are welcome.
+
+> **iOS cannot run this, and no change to this script would fix that.** The
+> iOS players built on mpv are libmpv behind their own native UI: they draw no
+> mpv OSD for a script to render into, and their libmpv is generally built
+> without Lua. More fundamentally, iOS does not let an app launch another
+> executable, and every network fetch here is a `curl`/`wget` subprocess, as is
+> every YouTube resolve (`yt-dlp`) and every thumbnail (`ffmpeg`). A feed
+> browser for iOS would have to be a native app that used libmpv for playback
+> only — a different program, not a port of this one.
 
 ---
 
 ## 2. Install
 
-### 2.1 Locate `%APPDATA%\mpv`
+### 2.1 mpv's config directory
 
-Press <kbd>Win</kbd>+<kbd>R</kbd>, type `%APPDATA%\mpv`, press Enter. That is
-mpv's configuration folder, normally:
+`rss.lua` goes in `scripts/` inside it. Where that is:
 
-```
-C:\Users\<you>\AppData\Roaming\mpv
-```
+| | |
+|---|---|
+| Windows | `%APPDATA%\mpv` — normally `C:\Users\<you>\AppData\Roaming\mpv` |
+| Linux, BSD | `~/.config/mpv` (or `$XDG_CONFIG_HOME/mpv`) |
+| macOS | `~/.config/mpv` — mpv.app also reads `~/Library/Application Support/mpv` |
 
-If the folder does not exist, create it — mpv does not create it itself when
-installed through winget.
+If it does not exist, create it: mpv does not create it itself. On Windows,
+<kbd>Win</kbd>+<kbd>R</kbd> → `%APPDATA%\mpv` → Enter gets you there.
 
-### 2.2 Create the `scripts` folder
+### 2.2 Copy the script in
 
-```
-%APPDATA%\mpv\scripts
-```
-
-### 2.3 Copy `rss.lua` into it
-
-```
-%APPDATA%\mpv\scripts\rss.lua
-```
-
-That is the whole installation. From PowerShell:
+Windows, from PowerShell:
 
 ```powershell
 New-Item -ItemType Directory -Force "$env:APPDATA\mpv\scripts" | Out-Null
 Copy-Item .\rss.lua "$env:APPDATA\mpv\scripts\rss.lua"
 ```
 
-### 2.4 Optional: the options file
+Linux, macOS, BSD:
+
+```sh
+mkdir -p ~/.config/mpv/scripts
+cp rss.lua ~/.config/mpv/scripts/
+```
+
+That is the whole installation.
+
+### 2.3 Optional: the options file
 
 ```powershell
 New-Item -ItemType Directory -Force "$env:APPDATA\mpv\script-opts" | Out-Null
 Copy-Item .\script-opts\rss.conf "$env:APPDATA\mpv\script-opts\rss.conf"
 ```
 
+```sh
+mkdir -p ~/.config/mpv/script-opts
+cp script-opts/rss.conf ~/.config/mpv/script-opts/
+```
+
 Everything in it is commented out, so it changes nothing until you edit it.
 See [§8](#8-configuration).
 
-### 2.5 Install yt-dlp
+### 2.4 Install yt-dlp
 
 Needed only to play YouTube videos.
 
-```powershell
-winget install yt-dlp.yt-dlp
-```
+| | |
+|---|---|
+| Windows | `winget install yt-dlp.yt-dlp` (`scoop` and `choco` work too) |
+| Debian, Ubuntu | `sudo apt install yt-dlp` |
+| Fedora | `sudo dnf install yt-dlp` |
+| Arch | `sudo pacman -S yt-dlp` |
+| macOS | `brew install yt-dlp` |
+| any | `pipx install yt-dlp`, or the standalone binary from the release page |
 
-(`scoop install yt-dlp` or `choco install yt-dlp` work too.) It must be on your
-`PATH` — check with:
+It must be on your `PATH` — check with `yt-dlp --version`. mpv finds it by
+itself; there is nothing to configure. The script checks for it at startup and
+tells you if it is missing when you try to play a YouTube item.
 
-```powershell
-yt-dlp --version
-```
+### 2.5 Optional: ffmpeg, for thumbnails
 
-mpv finds it by itself; there is nothing to configure. The script checks for it
-at startup and tells you if it is missing when you try to play a YouTube item.
+`winget install Gyan.FFmpeg`, `sudo apt install ffmpeg`, `brew install ffmpeg`
+— any build on `PATH`. Without it the preview pane is simply absent.
 
 ---
 
 ## 3. Starting it
 
-Plain `mpv.exe` with no file **exits immediately**, so there has to be a window
+Plain `mpv` with no file **exits immediately**, so there has to be a window
 to draw in. Two ways:
 
 ### Option A — the launcher (recommended, changes nothing globally)
 
-Copy `mpv-rss.cmd` anywhere you like (`%APPDATA%\mpv` is a tidy spot) and run
-it. Right-click → *Send to* → *Desktop (create shortcut)* if you want an icon.
-It runs:
+Two launchers ship with the script and do the same thing: **`mpv-rss.cmd`** for
+Windows, **`mpv-rss.sh`** for Linux, macOS and the BSDs (`chmod +x mpv-rss.sh`
+if your copy lost the bit). Put one anywhere you like — `%APPDATA%\mpv` or
+`~/.local/bin` are tidy spots. On Windows, right-click → *Send to* → *Desktop
+(create shortcut)* if you want an icon. Either one runs:
 
 ```
-mpv.exe --idle=yes --force-window=immediate --save-position-on-quit
-        --script-opts=rss-auto_open=yes
+mpv --idle=yes --force-window=immediate --save-position-on-quit
+    --script-opts=rss-auto_open=yes
 ```
 
 so mpv opens with an empty window and the RSS browser already on screen. Your
@@ -137,7 +180,8 @@ normal `mpv video.mkv` behaviour is untouched.
 
 ### Option B — make it mpv's default
 
-Create `%APPDATA%\mpv\mpv.conf` containing:
+Create `mpv.conf` in the config directory from [§2.1](#21-mpvs-config-directory)
+containing:
 
 ```
 idle=yes
@@ -145,7 +189,7 @@ force-window=immediate
 save-position-on-quit=yes
 ```
 
-Now bare `mpv.exe` opens an idle window and <kbd>Ctrl</kbd>+<kbd>R</kbd> works.
+Now bare `mpv` opens an idle window and <kbd>Ctrl</kbd>+<kbd>R</kbd> works.
 Note the side effect: with `idle=yes`, **mpv no longer quits when a video
 ends** — it returns to the idle window instead.
 
@@ -368,10 +412,15 @@ Every colour lives in one `THEME` table at the top of the rendering section of
 The interface uses Nerd Font glyphs when one is installed and falls back to a
 complete ASCII set when none is (`icons = auto | nerd | ascii`).
 
-> **The family name matters.** Windows registers JetBrains Mono Nerd Font as
-> **`JetBrainsMono NF`**, *not* "JetBrainsMono Nerd Font". Setting the latter
-> renders every icon as an empty box. Leave `font=` empty and the script finds
-> an installed Nerd Font by itself.
+> **The family name matters, and it is not the same on every platform.** The
+> Windows installer registers JetBrains Mono Nerd Font as **`JetBrainsMono
+> NF`**; fontconfig on Linux and macOS reports it as **`JetBrainsMono Nerd
+> Font`**. The wrong one renders every icon as an empty box. Leave `font=`
+> empty and the script finds an installed Nerd Font by itself — it knows both
+> spellings and asks the OS which it has: PowerShell on Windows, `fc-list` on
+> Linux and the BSDs, `fc-list` then `system_profiler` on macOS. If none of
+> those can answer (a macOS without fontconfig, say) the icons stay ASCII until
+> you set `icons=nerd` and `font=` yourself.
 
 ### Failed feeds
 
@@ -547,9 +596,18 @@ count as having watched it.
 
 ### In an editor
 
-<kbd>Alt</kbd>+<kbd>A</kbd> opens `rss-feeds.json` in **nvim inside Windows
-Terminal** (falling back to a plain console window if `wt.exe` is missing; set
-`editor=` to use something else, e.g. `code` or `notepad`).
+<kbd>Alt</kbd>+<kbd>A</kbd> opens `rss-feeds.json` in an editor. With the
+default `editor=auto` that means, per platform:
+
+| | |
+|---|---|
+| Windows | nvim inside Windows Terminal, falling back to nvim in a console window |
+| macOS | `open -t` — whichever plain-text editor is registered |
+| Linux, BSD | `$VISUAL` or `$EDITOR` — or, with neither set, the first of nvim, vim, nano, vi that is actually installed — inside the first terminal emulator that is: `x-terminal-emulator`, kitty, alacritty, wezterm, foot, gnome-terminal, konsole, xterm. And `xdg-open` if there is no terminal at all |
+
+Set `editor=` to any command instead. The file path is appended, or substituted
+for a `{}` if you put one in: `editor=code -w`, `editor=notepad`,
+`editor=kitty nvim`, `editor=x-terminal-emulator -e vim`.
 
 You do not have to close the editor afterwards: the file is watched, and the
 moment you `:w` the browser reloads the list, reports *"rss-feeds.json
@@ -559,7 +617,8 @@ merges.
 
 ### By editing the file
 
-`%APPDATA%\mpv\rss-feeds.json`:
+`<config>/rss-feeds.json` — `%APPDATA%\mpv` on Windows, `~/.config/mpv`
+elsewhere:
 
 ```json
 {
@@ -616,11 +675,18 @@ already-downloaded entries — no network, no YouTube search.
 All inside your mpv config folder; nothing is ever written to the mpv
 installation directory.
 
+Paths below are written as `<config>/`, which is `%APPDATA%\mpv\` on Windows
+and `~/.config/mpv/` elsewhere ([§2.1](#21-mpvs-config-directory)).
+
 | File | Contents |
 |---|---|
-| `%APPDATA%\mpv\rss-feeds.json` | your subscriptions |
-| `%APPDATA%\mpv\rss-cache.json` | downloaded entries, so navigation needs no network |
-| `%APPDATA%\mpv\rss-state.json` | watch state and resume positions, by video ID |
+| `<config>/rss-feeds.json` | your subscriptions |
+| `<config>/rss-cache.json` | downloaded entries, so navigation needs no network |
+| `<config>/rss-state.json` | watch state and resume positions, by video ID |
+
+Thumbnails and the pictures they are made from are cached outside the config
+directory, in the system scratch space: `%TEMP%` on Windows, `$TMPDIR` or
+`/tmp` elsewhere. Deleting them costs one re-download each.
 
 They are created automatically on first run. Watch state is keyed on the
 YouTube video ID (or the feed item's `guid`), not the title, so a renamed video
@@ -643,7 +709,7 @@ are not resurrected by the merge.
 
 ## 8. Configuration
 
-`%APPDATA%\mpv\script-opts\rss.conf`, one `key=value` per line. The shipped
+`<config>/script-opts/rss.conf`, one `key=value` per line. The shipped
 file lists every option with its default, all commented out. The ones you are
 most likely to touch:
 
@@ -674,7 +740,7 @@ alone cannot push more items on screen than physically fit.
 
 Options also work on the command line:
 
-```powershell
+```
 mpv --script-opts=rss-font_size=12,rss-date_format=relative
 ```
 
@@ -682,34 +748,35 @@ mpv --script-opts=rss-font_size=12,rss-date_format=relative
 
 ## 9. Troubleshooting
 
-**Nothing happens when I run `mpv.exe`** — mpv with no file exits immediately.
-Use `mpv-rss.cmd`, or add `idle=yes` and `force-window=immediate` to
-`mpv.conf` ([§3](#3-starting-it)).
+**Nothing happens when I run `mpv`** — mpv with no file exits immediately.
+Use `mpv-rss.cmd` / `mpv-rss.sh`, or add `idle=yes` and `force-window=immediate`
+to `mpv.conf` ([§3](#3-starting-it)).
 
 **<kbd>Ctrl</kbd>+<kbd>R</kbd> does nothing** — check the script actually
 loaded:
 
-```powershell
+```
 mpv --msg-level=rss=debug --idle=yes --force-window=immediate
 ```
 
-You should see `Loading lua script …\rss.lua` and `rss ready (feeds=… cache=…
+You should see `Loading lua script …/rss.lua` and `rss ready (feeds=… cache=…
 state=…)`. If another script already uses `ctrl+r`, change `key_open`.
 
-**A feed shows a red error line** — the message is curl's or PowerShell's,
-shown next to the feed name, e.g. `curl: (22) … error: 404` for a wrong URL or
-`Could not connect` for a dead host. Other feeds keep loading regardless. The
-browser never takes mpv down over a bad feed.
+**A feed shows a red error line** — the message comes from whichever HTTP
+backend ran, shown next to the feed name: `curl: (22) … error: 404` for a wrong
+URL, `Could not connect` for a dead host, or `curl could not be run — is it
+installed?` when the program itself is missing. Other feeds keep loading
+regardless. The browser never takes mpv down over a bad feed.
 
 **`RSS: Invalid XML`** — the URL returned something that is not a feed, usually
 an HTML error page. Open the URL in a browser to check.
 
-**`RSS: yt-dlp not available`** — install it (§2.5) and make sure `yt-dlp
+**`RSS: yt-dlp not available`** — install it ([§2.4](#24-install-yt-dlp)) and make sure `yt-dlp
 --version` works in the same shell you start mpv from.
 
 **A video does not play** — try the URL directly:
 
-```powershell
+```
 mpv "https://www.youtube.com/watch?v=VIDEOID"
 ```
 
@@ -718,21 +785,25 @@ YouTube breakage.
 
 **Inspect what the parser sees from a feed:**
 
-```powershell
+```
 mpv --idle=yes --msg-level=rss=debug --script-opts=rss-debug_parse=https://www.youtube.com/feeds/videos.xml?channel_id=UC...
 ```
 
 It prints the entry count and the first five entries with their id, date, title
 and URL. A local file path works too.
 
-**Force the other HTTP backend** (if curl is blocked by policy, say):
+**Force a particular HTTP backend** (if curl is blocked by policy, say):
 
-```powershell
-mpv --script-opts=rss-http_backend=powershell
+```
+mpv --script-opts=rss-http_backend=powershell   # Windows
+mpv --script-opts=rss-http_backend=wget         # Linux, macOS, BSD
 ```
 
-**Start over** — delete `rss-cache.json` and `rss-state.json` from
-`%APPDATA%\mpv`. They are rebuilt on the next refresh.
+**No icons on Linux or macOS** — install `fontconfig` so `fc-list` can answer,
+or name the family yourself: `--script-opts=rss-icons=nerd,rss-font=JetBrainsMono Nerd Font`.
+
+**Start over** — delete `rss-cache.json` and `rss-state.json` from the config
+directory. They are rebuilt on the next refresh.
 
 ---
 

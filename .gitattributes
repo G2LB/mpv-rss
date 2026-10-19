@@ -1,0 +1,4 @@
+# A CRLF shebang line is not a shebang on Linux or macOS, so the Unix launcher
+# keeps LF wherever it is checked out -- and the Windows one keeps CRLF.
+*.sh  text eol=lf
+*.cmd text eol=crlf
