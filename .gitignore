@@ -1,0 +1,4 @@
+# Local runtime state — written by rss.lua, not part of the script
+rss-feeds.json
+rss-cache.json
+rss-state.json
