@@ -1554,6 +1554,18 @@ function LIB.norm(path)
     return path
 end
 
+-- A path that came back out of the player, put into the spelling LIB.entry
+-- keyed it under. mpv answers "path" and a playlist filename in its own
+-- spelling -- on Windows with backslashes, whichever way the file was handed
+-- to loadfile -- so a lookup with the raw string misses every library entry.
+-- Only the separators: the expand-path and trailing-slash work in LIB.norm is
+-- for paths out of the feeds file, not for ones mpv just told us about.
+function LIB.key(path)
+    if type(path) ~= "string" then return nil end
+    if not path:find("\\", 1, true) then return path end
+    return (path:gsub("\\", "/"))
+end
+
 function LIB.join(dir, name)
     if dir == "" or dir:sub(-1) == "/" then return dir .. name end
     return dir .. "/" .. name
@@ -2097,8 +2109,9 @@ end
 local function entry_by_url(url)
     if not url then return nil end
     -- a file from a library, so that progress, resume and the markers work on
-    -- local files exactly as they do on a feed item
-    local f = LIB.byurl[url]
+    -- local files exactly as they do on a feed item. LIB.key puts mpv's own
+    -- spelling of the path back into the one LIB.byurl is keyed with.
+    local f = LIB.byurl[url] or LIB.byurl[LIB.key(url)]
     if f then return f end
     for _, c in pairs(cache) do
         for _, e in ipairs(c.entries) do
@@ -3545,15 +3558,66 @@ render = function()
                 { "q", "close the browser (mpv keeps playing)" },
             } },
         }
+        -- One flat page of lines rather than a straight run of body:add, so
+        -- that it can be scrolled: the screen is taller than a small window
+        -- and the groups past the bottom edge were simply lost to the clip,
+        -- with nothing on screen to say there was more.
+        local lines = {}
         for gi, grp in ipairs(groups) do
-            body:add({ text = col("blue", true) .. grp[1], size = s.meta,
-                       indent = ind2, gap = gi > 1 and math.floor(s.body * 0.6) or 0 })
+            lines[#lines + 1] = { text = col("blue", true) .. grp[1], size = s.meta,
+                                  indent = ind2,
+                                  gap = gi > 1 and math.floor(s.body * 0.6) or 0 }
             for _, k in ipairs(grp[2]) do
-                body:add({
+                lines[#lines + 1] = {
                     text = col("fg") .. k[1], size = s.meta, indent = ind3,
                     right = col("dark5") .. k[2],
-                })
+                }
             end
+        end
+
+        -- How many lines fit from line `from` down. Two hint lines are kept
+        -- free for the markers, exactly as page_size() keeps them for a list.
+        -- The gap belongs to the line above it, so the first line of a page
+        -- never pays for one (and is drawn without it below).
+        local room = g.content_h - s.hint * 2
+        local function fits(from)
+            local used, n = 0, 0
+            for i = from, #lines do
+                local lh = lines[i].size + ((i > from) and lines[i].gap or 0)
+                if used + lh > room then break end
+                used, n = used + lh, n + 1
+            end
+            return math.max(n, 1)
+        end
+
+        -- The offset is clamped here, the one place that knows how tall the
+        -- page is and how much of it the window can hold: the keys in §15
+        -- only nudge it. The last page is the first one whose window reaches
+        -- the final line, so scrolling stops with the page full rather than
+        -- trailing off into blank space.
+        local max_scroll = 0
+        for i = 1, #lines do
+            if i + fits(i) - 1 >= #lines then max_scroll = i - 1 break end
+        end
+        ui.help_max_scroll = max_scroll
+        ui.help_scroll = clamp(ui.help_scroll or 0, 0, max_scroll)
+
+        local from  = ui.help_scroll + 1
+        local count = fits(from)
+        local last  = math.min(#lines, from + count - 1)
+        if from > 1 then
+            body:add({ text = col("dark5") .. string.format("▲ %d more", from - 1),
+                       size = s.hint, indent = ind2 })
+        end
+        for i = from, last do
+            local it = lines[i]
+            if i == from then it.gap = 0 end
+            body:add(it)
+        end
+        if last < #lines then
+            body:add({ text = col("dark5") .. string.format("▼ %d more", #lines - last),
+                       size = s.hint, indent = ind2,
+                       gap = math.floor(s.body * 0.3) })
         end
 
     elseif ui.view == "error" then
@@ -3709,7 +3773,8 @@ render = function()
         foot:add({ text = col("dark5") .. "y  confirm      any other key  cancel",
                    size = s.hint })
     elseif ui.view == "help" then
-        hint = "Esc / ?  Back      q  Close"
+        hint = narrow and "↑↓ / j k  Scroll   Esc  Back"
+            or "↑↓ / j k  Scroll     PgUp / PgDn  Page     Esc / ?  Back     q  Close"
     elseif ui.view == "error" then
         hint = "r  Retry this feed      Esc  Back      q  Close"
     elseif ui.view == "playlist" then
@@ -3976,7 +4041,7 @@ end
 -- Attribute progress to whatever is playing, including items that reached the
 -- player through the playlist rather than through Enter.
 mp.register_event("file-loaded", function()
-    local path = mp.get_property("path")
+    local path = LIB.key(mp.get_property("path"))
     local e = entry_by_url(path) or (path and fallback.entry[path])
     start_tracking(e)
     -- An unseekable network stream has no end to measure against, so it is a
@@ -4079,7 +4144,7 @@ end)
 -- Playing something new from the browser should start it, not hold a frame
 -- from the file that just ended.
 mp.register_event("start-file", function()
-    fallback.opened = mp.get_property("path")
+    fallback.opened = LIB.key(mp.get_property("path"))
     if fallback.parked then
         fallback.parked = false
         mp.set_property_bool("pause", false)
@@ -4484,6 +4549,14 @@ end
 local function current_row() return ui.rows[ui.sel] end
 
 local function move(delta)
+    -- The help screen has no rows to select; it is one page of text, so the
+    -- navigation keys move the page instead. §12 clamps the offset, which is
+    -- where the height of the page is known.
+    if ui.view == "help" then
+        ui.help_scroll = clamp((ui.help_scroll or 0) + delta, 0, ui.help_max_scroll or 0)
+        render()
+        return
+    end
     if #ui.rows == 0 then return end
     ui.sel = clamp(ui.sel + delta, 1, #ui.rows)
     rebuild_rows()
@@ -4505,7 +4578,7 @@ end
 local function open_help_view()
     ui.prev_view = { view = ui.view, sel = ui.sel, scroll = ui.scroll }
     ui.view = "help"
-    ui.sel, ui.scroll = 1, 0
+    ui.sel, ui.scroll, ui.help_scroll = 1, 0, 0
     rebuild_rows()
     render()
 end
@@ -5012,8 +5085,14 @@ register_menu_bindings = function()
     bind(menu_binding_names, "j", "j", guarded(function() move(1) end), { repeatable = true })
     bind(menu_binding_names, "pgup", "pgup", guarded(function() move(-page_size()) end), { repeatable = true })
     bind(menu_binding_names, "pgdwn", "pgdwn", guarded(function() move(page_size()) end), { repeatable = true })
-    bind(menu_binding_names, "home", "home", guarded(function() ui.sel = 1 rebuild_rows() render() end))
-    bind(menu_binding_names, "end", "end", guarded(function() ui.sel = #ui.rows rebuild_rows() render() end))
+    bind(menu_binding_names, "home", "home", guarded(function()
+        if ui.view == "help" then ui.help_scroll = 0 render() return end
+        ui.sel = 1 rebuild_rows() render()
+    end))
+    bind(menu_binding_names, "end", "end", guarded(function()
+        if ui.view == "help" then ui.help_scroll = ui.help_max_scroll or 0 render() return end
+        ui.sel = #ui.rows rebuild_rows() render()
+    end))
 
     bind(menu_binding_names, "enter", "enter", guarded(activate))
     bind(menu_binding_names, "kp_enter", "kpenter", guarded(activate))

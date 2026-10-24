@@ -236,7 +236,11 @@ it. Nothing else is needed.
 | <kbd>?</kbd> | keyboard shortcuts, on screen |
 
 <kbd>?</kbd> shows all of this inside mpv, grouped by Navigate / Play /
-Folders / Feeds / Other, so you never need this table while using it.
+Folders / Feeds / Other, so you never need this table while using it. In a
+window too small to hold the whole list it scrolls, with the same keys as a
+list — <kbd>↑</kbd> <kbd>↓</kbd> or <kbd>k</kbd> <kbd>j</kbd>, <kbd>PgUp</kbd>
+<kbd>PgDn</kbd>, <kbd>Home</kbd> <kbd>End</kbd> — and says how many lines are
+above and below.
 
 Because of that there is **no permanent hint bar** along the bottom — the panel
 shows content and nothing else. The bottom row still appears when it has
