@@ -148,6 +148,27 @@ local opts = {
     -- raise font_size -- a taller card gives a taller band.
     thumbnail_aspect = 1.78,
 
+    -- local media libraries
+    -- Folders on disk -- Videos, Music, Audiobooks -- browsed as a tree
+    -- beside the feeds. WHICH folders is declared in rss-feeds.json under
+    -- "libraries" (alt+a opens it); the options here only decide how they are
+    -- browsed. A library whose folder is not there is left out silently, so
+    -- one file can be carried between machines with different disks.
+    libraries      = true,      -- no = ignore the "libraries" key entirely
+    library_sort   = "name",    -- name | date | size; folders are always by name
+    library_index  = true,      -- walk each library in the background when the
+                                -- browser opens, so / searches the whole thing
+                                -- and the tab bar can say how much is in there
+    library_depth  = 8,         -- how many folders deep that walk goes
+    library_max    = 20000,     -- and how many files it keeps at most
+    library_hidden = false,     -- include dotfiles and hidden folders
+    -- "Wim_Hof_Method_[abc123].mp4" -> "Wim Hof Method". The real filename is
+    -- still shown in the header card.
+    library_clean_names = true,
+    -- Extra extensions to treat as playable, comma separated, without the dot.
+    -- The built-in list covers the usual video and audio ones, m4b included.
+    library_extensions = "",
+
     -- http
     -- auto picks curl, then PowerShell on Windows / wget everywhere else
     http_backend = "auto",  -- auto | curl | wget | powershell
@@ -163,7 +184,6 @@ local opts = {
 }
 options.read_options(opts, "rss")
 
-local SCRIPT_NAME = "rss"
 local UA = "mpv-rss/1.0"
 
 --==========================================================================
@@ -331,25 +351,147 @@ local PATHS = {
     feeds = resolve_path(opts.feeds_file, "rss-feeds.json"),
     cache = resolve_path(opts.cache_file, "rss-cache.json"),
     state = resolve_path(opts.state_file, "rss-state.json"),
+    -- set when the feeds file is there but does not parse: nothing may write
+    -- over it until the user has fixed it, or one stray comma would cost them
+    -- every feed and every library in it
+    broken = false,
 }
 
-local function read_json(path, fallback)
+-- rss-feeds.json is edited by hand, so it is read as JSON with comments:
+-- // to end of line, /* ... */, and a comma left dangling in front of } or ].
+-- That is what "commented out" means for a feed or a library -- strict JSON
+-- has no comments, and mpv's parser rejects one outright, which would
+-- otherwise cost the whole file. Strings are tracked as strings, so https://
+-- and //nas/share -- the two things in there most likely to hold a slash --
+-- survive.
+local function strip_jsonc(text)
+    local out, i, n = {}, 1, #text
+    while i <= n do
+        local c = text:sub(i, i)
+        if c == '"' then                       -- a string: copied verbatim
+            local j = i + 1
+            while j <= n do
+                local d = text:sub(j, j)
+                if d == "\\" then j = j + 2        -- an escape, whatever it is
+                elseif d == '"' then break
+                else j = j + 1 end
+            end
+            out[#out + 1] = text:sub(i, math.min(j, n))
+            i = j + 1
+        elseif c == "/" and text:sub(i + 1, i + 1) == "/" then
+            i = text:find("\n", i, true) or (n + 1)
+        elseif c == "/" and text:sub(i + 1, i + 1) == "*" then
+            local j = text:find("*/", i + 2, true)
+            out[#out + 1] = " "
+            i = j and (j + 2) or (n + 1)
+        else
+            out[#out + 1] = c
+            i = i + 1
+        end
+    end
+    -- a trailing comma is what commenting out the last entry of a list leaves
+    return (table.concat(out):gsub(",%s*([%]}])", "%1"))
+end
+
+-- Second return value: the file is there but could not be understood, which
+-- is not the same as absent. A caller must not overwrite a file in that state
+-- -- one typo in a hand-edited feeds file would otherwise cost the lot.
+local function read_json(path, fallback, jsonc)
     local data = file_read(path)
-    if not data or trim(data) == "" then return fallback end
+    if not data or trim(data) == "" then return fallback, false end
     -- Editors on Windows (Notepad, PowerShell's Set-Content -Encoding utf8)
     -- happily add a UTF-8 BOM, which the JSON parser rejects.
     data = data:gsub("^\239\187\191", "")
+    if jsonc then data = strip_jsonc(data) end
     local parsed = utils.parse_json(data)
     if type(parsed) ~= "table" then
         msg.warn("could not parse JSON: " .. path)
-        return fallback
+        return fallback, true
     end
-    return parsed
+    return parsed, false
 end
 
-local function write_json(path, tbl)
+-- mpv's format_json writes one long line. That is right for the cache and
+-- unkind for rss-feeds.json, which is a file people open and edit, so that
+-- one is re-indented on the way out: one feed or library per line, each still
+-- compact enough to comment out in one go. A character-wise pass that knows
+-- nothing about JSON beyond quotes, escapes, brackets and commas -- it only
+-- moves whitespace, so whatever mpv escaped stays escaped.
+local function json_indent(src)
+    local out, i, n, depth = {}, 1, #src, 0
+    local function nl() out[#out + 1] = "\n" .. string.rep("\t", depth) end
+    -- The end of a string that starts at j, so neither pass below mistakes a
+    -- bracket inside a title for structure.
+    local function str_end(j)
+        j = j + 1
+        while j <= n do
+            local c = src:sub(j, j)
+            if c == "\\" then j = j + 2
+            elseif c == '"' then return j
+            else j = j + 1 end
+        end
+        return n
+    end
+    -- Where the container starting at j ends, if it holds no container of its
+    -- own and is short enough to stay on one line; nil if it must be opened up.
+    local function flat_end(j)
+        local d, k = 0, j
+        while k <= n do
+            local c = src:sub(k, k)
+            if c == '"' then k = str_end(k)
+            elseif c == "{" or c == "[" then
+                if k > j then return nil end
+                d = d + 1
+            elseif c == "}" or c == "]" then
+                d = d - 1
+                if d == 0 then return (k - j <= 400) and k or nil end
+            end
+            k = k + 1
+        end
+        return nil
+    end
+    while i <= n do
+        local c = src:sub(i, i)
+        if c == '"' then
+            local e = str_end(i)
+            out[#out + 1] = src:sub(i, e)
+            i = e + 1
+        elseif c == "{" or c == "[" then
+            local e = flat_end(i)
+            if e then
+                out[#out + 1] = src:sub(i, e)
+                i = e + 1
+            else
+                out[#out + 1] = c
+                depth = depth + 1
+                nl()
+                i = i + 1
+            end
+        elseif c == "}" or c == "]" then
+            depth = math.max(0, depth - 1)
+            nl()
+            out[#out + 1] = c
+            i = i + 1
+        elseif c == "," then
+            out[#out + 1] = ","
+            nl()
+            i = i + 1
+        elseif c == ":" then
+            out[#out + 1] = ": "
+            i = i + 1
+        else
+            out[#out + 1] = c
+            i = i + 1
+        end
+    end
+    return table.concat(out)
+end
+
+local function write_json(path, tbl, pretty)
     local data = utils.format_json(tbl)
     if type(data) ~= "string" then return false, "could not serialise JSON" end
+    -- a file people edit ends in a newline, like every other text file
+    if pretty then data = json_indent(data) .. "\n" end
     return file_write(path, data)
 end
 
@@ -1073,13 +1215,28 @@ end
 -- 7. PERSISTENCE: feeds / cache / watched state
 --==========================================================================
 
+-- Local media libraries, defined in section 8 beside the entry lists they
+-- feed. Named here because rss-feeds.json carries them and this is where that
+-- file is read and written.
+local LIB                       -- forward declaration
+
 local feeds = {}    -- { {name=, url=, enabled=}, ... }
 local cache = {}    -- url -> { name=, title=, fetched_at=, entries={} }
 local state = { watched = {}, last_refresh = 0 }
 local feed_errors = {}  -- url -> last error string
 
 local function load_feeds()
-    local data = read_json(PATHS.feeds, nil)
+    local data, broken = read_json(PATHS.feeds, nil, true)
+    PATHS.broken = broken
+    -- A file that is there but does not parse is left exactly as it is, and so
+    -- is everything already loaded from it: one stray comma in a hand-edited
+    -- file must not cost somebody every feed and every library in it.
+    if broken then
+        msg.error("rss-feeds.json does not parse -- leaving it, and what is "
+            .. "already loaded from it, alone. Fix the file and press "
+            .. tostring(opts.key_edit) .. " or restart.")
+        return
+    end
     feeds = {}
     if type(data) == "table" and type(data.feeds) == "table" then
         for _, f in ipairs(data.feeds) do
@@ -1092,9 +1249,17 @@ local function load_feeds()
             end
         end
     end
-    if not data then
-        -- create the file so the user has something to edit
-        write_json(PATHS.feeds, { feeds = {} })
+    LIB.load(data)
+    -- First run, or a file written before libraries existed: write the key
+    -- out, so it is something to edit rather than something the README talks
+    -- about and the file does not have.
+    if not data or LIB.offer then
+        local out = {}
+        for _, f in ipairs(feeds) do
+            out[#out + 1] = { name = f.name, url = f.url, enabled = f.enabled ~= false }
+        end
+        write_json(PATHS.feeds, { feeds = out, libraries = LIB.raw or {} }, true)
+        LIB.offer = false
     end
 end
 
@@ -1106,8 +1271,18 @@ local removed_urls = {}
 -- added by hand, or by another mpv instance, appears without a restart and
 -- without touching the cache or the watch state. Returns how many were added.
 local function reload_feeds()
-    local data = read_json(PATHS.feeds, nil)
-    if type(data) ~= "table" or type(data.feeds) ~= "table" then return 0 end
+    local data, broken = read_json(PATHS.feeds, nil, true)
+    PATHS.broken = broken
+    if type(data) ~= "table" then return 0 end
+    -- A library added, renamed or commented out while mpv was running. Only
+    -- when it actually changed: LIB.load() drops the directory listings and
+    -- the index with them, and re-walking the disk on every open of the
+    -- browser would be a strange thing to do about a file nobody touched.
+    if data.libraries ~= nil then
+        local sig = utils.format_json(data.libraries)
+        if sig ~= LIB.sig then LIB.load(data) end
+    end
+    if type(data.feeds) ~= "table" then return 0 end
     local have = {}
     for _, f in ipairs(feeds) do have[f.url] = true end
     local added = 0
@@ -1128,7 +1303,16 @@ end
 
 -- Writing merges with what is on disk first, so a feed added to the file while
 -- mpv was running is never silently overwritten by our in-memory copy.
+-- The "libraries" key is carried across untouched, exactly as it was read --
+-- disabled entries, entries for folders this machine does not have, and all.
+-- Nothing in the browser edits libraries, so nothing here should rewrite
+-- them. Real // comments do not survive a rewrite, which is what "enabled":
+-- false is for: it says the same thing in a form the file can keep.
 local function save_feeds()
+    if PATHS.broken then
+        msg.error("not writing rss-feeds.json: it does not parse")
+        return false
+    end
     reload_feeds()
     local out = {}
     for _, f in ipairs(feeds) do
@@ -1136,7 +1320,9 @@ local function save_feeds()
             out[#out + 1] = { name = f.name, url = f.url, enabled = f.enabled ~= false }
         end
     end
-    local ok, err = write_json(PATHS.feeds, { feeds = out })
+    local payload = { feeds = out }
+    if LIB.raw ~= nil then payload.libraries = LIB.raw end
+    local ok, err = write_json(PATHS.feeds, payload, true)
     if not ok then msg.error("could not save feeds: " .. tostring(err)) end
     return ok
 end
@@ -1185,8 +1371,6 @@ local function save_cache()
     if not ok then msg.warn("could not save cache: " .. tostring(err)) end
 end
 
-local MAX_WATCHED = 5000
-
 local function load_state()
     local data = read_json(PATHS.state, nil)
     state = { watched = {}, progress = {}, last_refresh = 0 }
@@ -1213,6 +1397,7 @@ local function load_state()
 end
 
 local function save_state()
+    local MAX_WATCHED = 5000
     -- keep the newest MAX_WATCHED ids so the file cannot grow without bound
     local list = {}
     for id, ts in pairs(state.watched) do list[#list + 1] = { id = id, ts = ts } end
@@ -1285,6 +1470,535 @@ end
 -- 8. ENTRY LISTS
 --==========================================================================
 
+--------------------------------------------------------------------------
+-- Local media libraries
+--------------------------------------------------------------------------
+-- A library is a folder on disk -- Videos, Music, Audiobooks -- browsed as a
+-- tree beside the subscriptions. Nothing about it is fetched: the only I/O is
+-- reading directories, and that happens one level at a time, as you walk into
+-- them, so pointing this at a disk with 50000 files costs nothing until you
+-- actually look inside.
+--
+-- Separately, each library is walked once per session to build an index: a
+-- flat list of every file under it. That is what lets "/" search a whole
+-- library rather than the one folder you are standing in, what lets p queue
+-- an album that has its own subfolders, and what lets the tab bar say how
+-- much is in there. The walk is incremental -- a handful of directories per
+-- tick -- so a slow disk cannot stall mpv, and it is capped by library_max.
+--
+-- Libraries are declared in rss-feeds.json, beside the feeds:
+--
+--   "libraries": [
+--     { "name": "Videos",     "path": "C:/Users/Luke/Videos",     "kind": "videos" },
+--     { "name": "Music",      "path": "C:/Users/Luke/Music",      "kind": "music" },
+--     { "name": "Audiobooks", "path": "C:/Users/Luke/Audiobooks", "kind": "audiobooks" }
+--     // { "name": "NAS", "path": "//nas/media", "kind": "videos" }
+--   ]
+--
+-- kind is videos | music | audiobooks, guessed from the name when left out.
+-- Music and audiobooks get a tab of their own; a videos library joins the
+-- VIDEOS tab, next to the channels. An entry is left out, without complaint,
+-- when it is commented out, when it says "enabled": false, or when its folder
+-- is not on this machine -- so the same file can be carried between a desktop
+-- and a laptop that do not have the same disks.
+--
+-- Library files are deliberately absent from the New and All items lists:
+-- those are "what has arrived since I last looked", which is a question about
+-- a feed. A folder of 4000 songs has no answer to it and would drown the one
+-- the feeds gave.
+--
+-- One table rather than a dozen locals: the main chunk is at LuaJIT's ceiling
+-- of 200 locals (see PLAT in section 2).
+
+LIB = {
+    defs  = {},    -- the active definitions, in file order
+    raw   = nil,   -- "libraries" exactly as read, so saving round-trips it
+    dirs  = {},    -- path -> { dirs = {...}, files = {...} }, filled lazily
+    byurl = {},    -- file path -> entry, so playback can track local files
+    rev   = 0,     -- bumped when watch state changes, to expire the counters
+    scan  = nil,   -- the walk in progress
+    queue = {},    -- libraries still waiting for theirs
+    notify = nil,  -- set in section 9, once status() exists
+}
+
+-- The tab bar, left to right. Rebuilt by LIB.sync_tabs(): MUSIC and
+-- AUDIOBOOKS only exist when there is a library behind them.
+local TABS = { "all", "videos", "podcasts" }
+
+-- Which tab each kind of library lives in. videos has one already.
+LIB.KIND_TAB = { videos = "videos", music = "music", audiobooks = "audiobooks" }
+
+LIB.VIDEO_EXT = {
+    mp4 = true, mkv = true, webm = true, avi = true, mov = true, m4v = true,
+    mpg = true, mpeg = true, wmv = true, flv = true, ts = true, m2ts = true,
+    ogv = true, vob = true, divx = true, rmvb = true, ["3gp"] = true,
+}
+LIB.AUDIO_EXT = {
+    mp3 = true, m4a = true, m4b = true, aac = true, flac = true, ogg = true,
+    oga = true, opus = true, wav = true, wma = true, aiff = true, aif = true,
+    alac = true, mka = true, ape = true, mpc = true, wv = true,
+}
+
+function LIB.on() return opts.libraries ~= false end
+
+-- Paths are normalised to forward slashes -- mpv, ffmpeg and Windows itself
+-- all take them -- so that an id derived from a path does not change with the
+-- way the folder happened to be spelled in the file.
+function LIB.norm(path)
+    path = trim(tostring(path or ""))
+    if path == "" then return "" end
+    local ex = mp.command_native({ "expand-path", path })
+    if type(ex) == "string" and ex ~= "" then path = ex end
+    path = path:gsub("\\", "/")
+    if #path > 1 then path = path:gsub("([^:/])/+$", "%1") end
+    return path
+end
+
+function LIB.join(dir, name)
+    if dir == "" or dir:sub(-1) == "/" then return dir .. name end
+    return dir .. "/" .. name
+end
+
+function LIB.is_dir(path)
+    local info = utils.file_info(path)
+    return info ~= nil and info.is_dir == true
+end
+
+-- The extension decides whether a file is worth a row at all. Returns what it
+-- is, so the row can be given the right icon.
+function LIB.media(name)
+    local ext = name:match("%.([%a%d]+)$")
+    if not ext then return nil end
+    ext = ext:lower()
+    if LIB.VIDEO_EXT[ext] then return "video" end
+    if LIB.AUDIO_EXT[ext] then return "audio" end
+    if not LIB.extra then
+        LIB.extra = {}
+        for e in tostring(opts.library_extensions or ""):gmatch("[%a%d]+") do
+            LIB.extra[e:lower()] = true
+        end
+    end
+    if LIB.extra[ext] then return "file" end
+    return nil
+end
+
+function LIB.visible(name)
+    if name == "" then return false end
+    if opts.library_hidden then return true end
+    if name:sub(1, 1) == "." then return false end
+    -- Windows keeps its per-folder settings in these. Not media, and not
+    -- hidden by a leading dot either.
+    local l = name:lower()
+    return l ~= "desktop.ini" and l ~= "thumbs.db" and l ~= "albumartsmall.jpg"
+end
+
+-- A library with no kind of its own is named after what is in it often
+-- enough that guessing beats asking. Dutch and German too: this is a browser
+-- people point at their own disks.
+function LIB.guess_kind(text)
+    local l = tostring(text or ""):lower()
+    if l:find("audiobook", 1, true) or l:find("audio book", 1, true)
+        or l:find("hoorbo", 1, true) or l:find("luisterbo", 1, true)
+        or l:find("spoken", 1, true) then return "audiobooks" end
+    if l:find("music", 1, true) or l:find("muziek", 1, true)
+        or l:find("musik", 1, true) or l:find("songs", 1, true)
+        or l:find("album", 1, true) then return "music" end
+    return "videos"
+end
+
+-- Commented out by hand: a name beginning with //, --, # or ;. The path is
+-- never tested this way -- a leading // there is a UNC share and a leading /
+-- is simply the root of a Unix disk.
+function LIB.commented(name)
+    local l = trim(tostring(name or ""))
+    return l:sub(1, 2) == "//" or l:sub(1, 2) == "--"
+        or l:sub(1, 1) == "#" or l:sub(1, 1) == ";"
+end
+
+-- The three standard folders, per platform. Offered only when the file has no
+-- "libraries" key at all -- a first run, or a file written by an older
+-- version -- and then written out, so there is something to edit rather than
+-- a key the README talks about and the file does not have. A library deleted
+-- from the file stays deleted; one whose folder does not exist is skipped
+-- when it is read back, which is how a machine without an Audiobooks folder
+-- quietly ends up without an AUDIOBOOKS tab.
+function LIB.defaults()
+    local home = mp.command_native({ "expand-path", "~/" })
+    if type(home) ~= "string" or home == "" or home == "~/" then
+        home = os.getenv("USERPROFILE") or os.getenv("HOME") or ""
+    end
+    home = LIB.norm(home)
+    if home == "" then return {} end
+    local out = {}
+    for _, d in ipairs({ { "Videos", "videos" }, { "Music", "music" },
+                         { "Audiobooks", "audiobooks" } }) do
+        out[#out + 1] = { name = d[1], path = LIB.join(home, d[1]),
+                          kind = d[2], enabled = true }
+    end
+    return out
+end
+
+-- Read the "libraries" key. An entry is an object, or a bare path string when
+-- there is nothing to say about it beyond where it is.
+function LIB.load(data)
+    LIB.defs, LIB.dirs, LIB.byurl = {}, {}, {}
+    LIB.scan, LIB.queue, LIB.extra = nil, {}, nil
+    LIB.rev = LIB.rev + 1
+    local list = (type(data) == "table") and data.libraries or nil
+    LIB.raw, LIB.offer = list, false
+    LIB.sig = utils.format_json(list or {})
+    -- No key at all, because the file is new or predates libraries. (A file
+    -- that is there and does not parse never reaches this: load_feeds() stops
+    -- at the door.)
+    if list == nil and LIB.on() then
+        list = LIB.defaults()
+        LIB.raw, LIB.offer = list, true
+    end
+    if not LIB.on() or type(list) ~= "table" then LIB.sync_tabs() return end
+
+    local seen = {}
+    for _, item in ipairs(list) do
+        local l = (type(item) == "string") and { path = item } or item
+        if type(l) == "table" and type(l.path) == "string" then
+            local path = LIB.norm(l.path)
+            local name = (type(l.name) == "string" and trim(l.name) ~= "")
+                and trim(l.name) or (path:match("([^/]+)/*$") or path)
+            local off = l.enabled == false or l.disabled == true
+                or LIB.commented(l.name)
+            if path ~= "" and not off and not seen[path] then
+                if LIB.is_dir(path) then
+                    seen[path] = true
+                    local kind = (type(l.kind) == "string") and l.kind:lower() or ""
+                    if not LIB.KIND_TAB[kind] then
+                        kind = LIB.guess_kind(name .. " " .. path)
+                    end
+                    LIB.defs[#LIB.defs + 1] = {
+                        name = name, path = path, kind = kind,
+                        sort = (type(l.sort) == "string") and l.sort or nil,
+                    }
+                else
+                    msg.verbose("library folder not on this machine, skipped: " .. path)
+                end
+            end
+        end
+    end
+    LIB.sync_tabs()
+end
+
+function LIB.has_kind(kind)
+    for _, l in ipairs(LIB.defs) do if l.kind == kind then return true end end
+    return false
+end
+
+function LIB.in_tab(tab)
+    local out = {}
+    for _, l in ipairs(LIB.defs) do
+        if tab == "all" or LIB.KIND_TAB[l.kind] == tab then out[#out + 1] = l end
+    end
+    return out
+end
+
+-- A tab with no feeds behind it, and therefore no New / All items rows.
+function LIB.only_tab(tab)
+    return tab == "music" or tab == "audiobooks"
+end
+
+function LIB.sync_tabs()
+    for i = #TABS, 1, -1 do TABS[i] = nil end
+    TABS[1], TABS[2], TABS[3] = "all", "videos", "podcasts"
+    if LIB.has_kind("music") then TABS[#TABS + 1] = "music" end
+    if LIB.has_kind("audiobooks") then TABS[#TABS + 1] = "audiobooks" end
+end
+
+-- A tab can disappear under you: the library behind it is removed from the
+-- file, or its disk is not mounted this time.
+function LIB.known_tab(tab)
+    for _, t in ipairs(TABS) do if t == tab then return true end end
+    return false
+end
+
+function LIB.def_for(path)
+    for _, l in ipairs(LIB.defs) do
+        if path == l.path or path:sub(1, #l.path + 1) == l.path .. "/" then
+            return l
+        end
+    end
+    return nil
+end
+
+-- The path of a file relative to its library: the breadcrumb, and what a
+-- filter matches besides the title, so searching for a performer finds the
+-- folder named after them.
+function LIB.rel(def, path)
+    if def and path:sub(1, #def.path + 1) == def.path .. "/" then
+        return path:sub(#def.path + 2)
+    end
+    return path
+end
+
+-- A filename as a title. The real one is still in the header card.
+function LIB.pretty(name)
+    local base = name
+    local ext = name:match("%.([%a%d]+)$")
+    if ext and LIB.media(name) then base = name:sub(1, #name - #ext - 1) end
+    if opts.library_clean_names == false then return base end
+    base = base:gsub("%s*%[[%w_%-]+%]%s*$", "")    -- the id yt-dlp appends
+    base = trim((base:gsub("_", " "):gsub("%s+", " ")))
+    return base ~= "" and base or name
+end
+
+function LIB.entry(path, name, kind)
+    local e = LIB.byurl[path]
+    if e then return e end
+    e = {
+        id = "file:" .. fnv1a(path),
+        url = path,
+        title = LIB.pretty(name),
+        file = name,
+        local_file = true,
+        media = LIB.media(name) or "file",
+        lib_kind = kind,
+    }
+    LIB.byurl[path] = e
+    return e
+end
+
+-- A date and a size cost one stat apiece, so they are read when something
+-- actually wants them -- the rows on screen, or a sort by one of the two.
+-- An index of 20000 files does not stat 20000 files.
+function LIB.stat(e)
+    if not e or e.statted then return e end
+    e.statted = true
+    local info = utils.file_info(e.url)
+    if info then
+        e.date = info.mtime
+        e.size = info.size
+    end
+    return e
+end
+
+-- "Track 2" before "Track 10": digits compare as numbers and the rest as
+-- lowercase text, which is what a music folder is named for.
+function LIB.natural(a, b)
+    local x, y = tostring(a):lower(), tostring(b):lower()
+    local i, j = 1, 1
+    while true do
+        local xd, xn = x:match("^(%d+)()", i)
+        local yd, yn = y:match("^(%d+)()", j)
+        if xd and yd then
+            local nx, ny = tonumber(xd), tonumber(yd)
+            if nx ~= ny then return nx < ny end
+            i, j = xn, yn
+        else
+            local cx, cy = x:sub(i, i), y:sub(j, j)
+            if cx == "" or cy == "" then return cx == "" and cy ~= "" end
+            if cx ~= cy then return cx < cy end
+            i, j = i + 1, j + 1
+        end
+    end
+end
+
+-- Returns the comparison, and whether it needs the files statted first.
+function LIB.sorter(def)
+    local how = (def and def.sort) or tostring(opts.library_sort or "name")
+    if how == "date" then
+        return function(a, b) return (a.date or 0) > (b.date or 0) end, true
+    elseif how == "size" then
+        return function(a, b) return (a.size or 0) > (b.size or 0) end, true
+    end
+    return function(a, b) return LIB.natural(a.file or "", b.file or "") end, false
+end
+
+-- One directory, cached: folders and playable files, both sorted. A file mpv
+-- cannot play is not a row.
+function LIB.list(path, def)
+    local hit = LIB.dirs[path]
+    if hit then return hit end
+    local out = { dirs = {}, files = {} }
+    local kind = def and def.kind or nil
+    for _, d in ipairs(utils.readdir(path, "dirs") or {}) do
+        if LIB.visible(d) then
+            out.dirs[#out.dirs + 1] = { name = d, path = LIB.join(path, d) }
+        end
+    end
+    for _, f in ipairs(utils.readdir(path, "files") or {}) do
+        if LIB.visible(f) and LIB.media(f) then
+            out.files[#out.files + 1] = LIB.entry(LIB.join(path, f), f, kind)
+        end
+    end
+    table.sort(out.dirs, function(a, b) return LIB.natural(a.name, b.name) end)
+    local cmp, needs_stat = LIB.sorter(def)
+    if needs_stat then for _, e in ipairs(out.files) do LIB.stat(e) end end
+    table.sort(out.files, cmp)
+    LIB.dirs[path] = out
+    return out
+end
+
+function LIB.depth()
+    return clamp(math.floor(tonumber(opts.library_depth) or 8), 1, 32)
+end
+
+function LIB.cap()
+    return clamp(math.floor(tonumber(opts.library_max) or 20000), 100, 200000)
+end
+
+-- Queue a library for the walk. force re-reads it, which is what r on a
+-- library row means: look at the disk again.
+function LIB.index(def, force)
+    if not def or def.indexing then return end
+    if force then
+        -- r means "look at the disk again": the listings go as well, or a
+        -- file copied in since the browser opened would stay invisible
+        def.index = nil
+        local under = def.path .. "/"
+        for path in pairs(LIB.dirs) do
+            if path == def.path or path:sub(1, #under) == under then
+                LIB.dirs[path] = nil
+            end
+        end
+    end
+    -- library_index=no: never walk the tree. Browsing still works, folder by
+    -- folder; "/" then filters the folder you are in rather than searching
+    -- everything under it, and the counts are left out.
+    if opts.library_index == false then return end
+    if def.index then return end
+    for _, q in ipairs(LIB.queue) do if q == def then return end end
+    LIB.queue[#LIB.queue + 1] = def
+    LIB.pump()
+end
+
+function LIB.index_all(force)
+    if not LIB.on() then return end
+    for _, l in ipairs(LIB.defs) do LIB.index(l, force) end
+end
+
+-- One library at a time, a handful of directories per tick. Depth first and
+-- in name order, which is also the order an audiobook wants to be played in.
+function LIB.pump()
+    local sc = LIB.scan
+    if not sc then
+        local def = table.remove(LIB.queue, 1)
+        if not def then return end
+        def.indexing = true
+        sc = { def = def, files = {}, folders = 0, cap = LIB.cap(),
+               depth = LIB.depth(), todo = { { def.path, 0 } } }
+        LIB.scan = sc
+    end
+    local budget = 12
+    while budget > 0 and #sc.todo > 0 and #sc.files < sc.cap do
+        local job = table.remove(sc.todo)
+        local list = LIB.list(job[1], sc.def)
+        for _, e in ipairs(list.files) do
+            if #sc.files >= sc.cap then break end
+            sc.files[#sc.files + 1] = e
+        end
+        if job[2] < sc.depth then
+            for i = #list.dirs, 1, -1 do
+                sc.todo[#sc.todo + 1] = { list.dirs[i].path, job[2] + 1 }
+            end
+        end
+        sc.folders = sc.folders + 1
+        budget = budget - 1
+    end
+    if #sc.todo == 0 or #sc.files >= sc.cap then
+        local def = sc.def
+        def.index, def.folders = sc.files, math.max(0, sc.folders - 1)
+        def.indexed_at, def.capped = os.time(), #sc.files >= sc.cap
+        def.indexing = false
+        LIB.scan = nil
+        LIB.rev = LIB.rev + 1
+        if LIB.notify then LIB.notify(def) end
+        if #LIB.queue > 0 then mp.add_timeout(0, LIB.pump) end
+        return
+    end
+    mp.add_timeout(0, LIB.pump)
+end
+
+-- files, never-played files, folders -- nil until the library has been walked.
+function LIB.counts(def)
+    if not def or not def.index then return nil end
+    if def.nrev ~= LIB.rev then
+        local n = 0
+        for _, e in ipairs(def.index) do
+            if item_state(e.id) == "unseen" then n = n + 1 end
+        end
+        def.nnew, def.nrev = n, LIB.rev
+    end
+    return #def.index, def.nnew, def.folders or 0
+end
+
+-- "/" inside a library searches the index, so it finds things anywhere under
+-- the folder you are in rather than only its own listing.
+function LIB.search(def, under, query)
+    local out = {}
+    local q = tostring(query or ""):lower()
+    if q == "" or not def or not def.index then return out end
+    local prefix = (under and under ~= def.path) and (under .. "/") or nil
+    for _, e in ipairs(def.index) do
+        if (not prefix) or e.url:sub(1, #prefix) == prefix then
+            if (LIB.rel(def, e.url) .. " " .. (e.title or "")):lower()
+                :find(q, 1, true) then
+                out[#out + 1] = e
+            end
+        end
+    end
+    return out
+end
+
+-- The first file under a folder, for the preview. Cheap on purpose: the
+-- listing if we already have it, otherwise the index, which stops at the
+-- first hit, and only then the disk.
+function LIB.first_file(def, path)
+    local have = LIB.dirs[path]
+    if have and have.files[1] then return have.files[1] end
+    if def and def.index then
+        local prefix = (path == def.path) and nil or (path .. "/")
+        for _, e in ipairs(def.index) do
+            if (not prefix) or e.url:sub(1, #prefix) == prefix then return e end
+        end
+        return nil
+    end
+    return LIB.list(path, def).files[1]
+end
+
+function LIB.human(bytes)
+    if type(bytes) ~= "number" or bytes <= 0 then return nil end
+    if bytes >= 1073741824 then
+        return string.format("%.1f GB", bytes / 1073741824)
+    elseif bytes >= 1048576 then
+        return string.format("%.0f MB", bytes / 1048576)
+    end
+    return string.format("%.0f kB", math.max(1, bytes / 1024))
+end
+
+-- "3 files in 2 folders", and the same sentence when there is one of each.
+function LIB.summary(files, folders)
+    local out = string.format("%d file%s", files, files == 1 and "" or "s")
+    if folders and folders > 0 then
+        out = out .. string.format("  in %d folder%s", folders,
+            folders == 1 and "" or "s")
+    end
+    return out
+end
+
+-- Every file under one folder, for queueing it whole. The index covers an
+-- album that keeps its discs in subfolders; without one, the single level is
+-- all that can be known without going to the disk.
+function LIB.files_under(def, path)
+    if def and def.index then
+        if path == def.path then return def.index end
+        local out = {}
+        local prefix = (path == def.path) and nil or (path .. "/")
+        for _, e in ipairs(def.index) do
+            if (not prefix) or e.url:sub(1, #prefix) == prefix then
+                out[#out + 1] = e
+            end
+        end
+        if #out > 0 then return out end
+    end
+    return LIB.list(path, def).files
+end
+
 local function feed_by_url(url)
     for _, f in ipairs(feeds) do if f.url == url then return f end end
     return nil
@@ -1302,10 +2016,14 @@ local function entries_for_feed(url)
     return out
 end
 
--- Artwork for an item: its own image, else the feed's show artwork.
+-- Artwork for an item: its own image, else the feed's show artwork. A file on
+-- disk is its own artwork -- ffmpeg lifts the cover out of an album track and
+-- the first frame out of a video -- so the preview works in a library with
+-- nothing to download.
 local function artwork_url(e)
     if not e then return nil end
     if e.thumb then return e.thumb end
+    if e.local_file then return e.url end
     local c = e.feed_url and cache[e.feed_url]
     return c and c.image or nil
 end
@@ -1378,6 +2096,10 @@ end
 -- progress tracking can show real titles and watch state.
 local function entry_by_url(url)
     if not url then return nil end
+    -- a file from a library, so that progress, resume and the markers work on
+    -- local files exactly as they do on a feed item
+    local f = LIB.byurl[url]
+    if f then return f end
     for _, c in pairs(cache) do
         for _, e in ipairs(c.entries) do
             if e.url == url then return e end
@@ -1407,13 +2129,18 @@ end
 
 local ui = {
     active = false,
-    tab = "all",            -- "all" | "videos" | "podcasts"
+    -- "all" | "videos" | "podcasts", plus "music" / "audiobooks" when a
+    -- library of that kind exists; TABS is the live list
+    tab = "all",
     narrow = false,         -- small-window layout; recomputed by layout()
-    view = "feeds",         -- "feeds" | "entries" | "playlist"
+    view = "feeds",         -- "feeds" | "entries" | "library" | "playlist"
     sel = 1,
     scroll = 0,
     feed_url = nil,         -- nil in entries view == All Videos
     feed_label = "",
+    lib = nil,              -- the library being browsed, in the library view
+    lib_path = nil,         -- which folder in it
+    lib_stack = {},         -- the folders above it: what Esc walks back up
     entries = {},           -- unfiltered list for the current view
     rows = {},              -- what is actually drawn (after filtering)
     filter = "",
@@ -1438,6 +2165,20 @@ local function status(text, seconds, tone)
     ui.status_tone = tone or "fg"
     ui.status_until = os.time() + (seconds or 5)
     if ui.active then render() else mp.osd_message(text, seconds or 4) end
+end
+
+-- What a finished index says for itself. Only worth a line when the browser
+-- is open and the library is big enough that the wait was visible; the counts
+-- in the list and the tab bar are the real result.
+LIB.notify = function(def)
+    if ui.active then
+        if #def.index >= 500 then
+            status(string.format("%s · %s", def.name,
+                LIB.summary(#def.index, def.folders)), 3, "cyan")
+        end
+        rebuild_rows()
+        render()
+    end
 end
 
 --==========================================================================
@@ -1718,6 +2459,11 @@ local ICON_SETS = {
         refresh = "󰑐", search = "󰍉", err = "󰀪",
         author = utf8_char(0xF0004),
         unseen = "●", resume = "◐", done = "✓", select = "▶",
+        -- local libraries: a folder, the three kinds of library, a
+        -- plain file, and the arrow on the row that walks back up
+        folder = utf8_char(0xF07B), music = utf8_char(0xF001),
+        book = utf8_char(0xF02D), file = utf8_char(0xF15B),
+        up = utf8_char(0xF062),
     },
     ascii = {
         all = "*", video = "[V]", podcast = "[P]",
@@ -1725,6 +2471,8 @@ local ICON_SETS = {
         refresh = "r", search = "/", err = "!",
         author = "@",
         unseen = "●", resume = "◐", done = "✓", select = "▶",
+        folder = "[+]", music = "[M]", book = "[A]", file = "-",
+        up = "^",
     },
 }
 local ICON = ICON_SETS.ascii      -- upgraded by probe_font() if one is present
@@ -1735,7 +2483,7 @@ local UI_FONT = ""                -- resolved font family, "" = mpv OSD default
 -- and macOS keeps it spelled out. Both spellings are listed, and the one that
 -- matches is also the one handed to ASS -- so the name is always the local one.
 -- No entry is a substring of another, so a hit is never the wrong family.
-local NERD_CANDIDATES = {
+PLAT.nerd_fonts = {
     "JetBrainsMono NF", "JetBrainsMono NFM", "FiraCode NF",
     "CaskaydiaCove NF", "Hack NF",
     "JetBrainsMono Nerd Font", "FiraCode Nerd Font",
@@ -1751,7 +2499,7 @@ local function probe_font()
     if opts.icons == "ascii" then return end
     if opts.icons == "nerd" then
         ICON = ICON_SETS.nerd
-        UI_FONT = (opts.font ~= "") and opts.font or NERD_CANDIDATES[1]
+        UI_FONT = (opts.font ~= "") and opts.font or PLAT.nerd_fonts[1]
         return
     end
 
@@ -1786,7 +2534,7 @@ local function probe_font()
                 try(i + 1)
                 return
             end
-            for _, want in ipairs(NERD_CANDIDATES) do
+            for _, want in ipairs(PLAT.nerd_fonts) do
                 if out:find(want, 1, true) then
                     ICON = ICON_SETS.nerd
                     UI_FONT = (opts.font ~= "") and opts.font or want
@@ -1821,6 +2569,43 @@ local function sizes()
         -- and render() draws at exactly this offset, so it lives in one place.
         card_gap = math.floor(base * 0.72),
     }
+end
+
+-- What the tab bar draws: one row per tab in TABS -- the id, an icon, a
+-- label, how many sources are behind it, how many items those hold, and how
+-- many of those have never been played. A library counts as one source, the
+-- same as a feed, and contributes the files its index found: MUSIC reads
+-- "1 / 33" for one folder of 33 songs, and VIDEOS adds a local folder to the
+-- channels it already had.
+--
+-- A field of LIB rather than a local of its own, for the reason given there.
+function LIB.tabinfo()
+    local tc = tab_counts()
+    local out = {}
+    for i, t in ipairs(TABS) do
+        local row
+        if t == "videos" then
+            row = { t, ICON.video, "VIDEOS", tc.vfeeds, tc.videos, tc.new_videos }
+        elseif t == "podcasts" then
+            row = { t, ICON.podcast, "PODCASTS", tc.pfeeds, tc.podcasts, tc.new_podcasts }
+        elseif t == "music" then
+            row = { t, ICON.music, "MUSIC", 0, 0, 0 }
+        elseif t == "audiobooks" then
+            row = { t, ICON.book, "AUDIOBOOKS", 0, 0, 0 }
+        else
+            row = { t, ICON.all, "ALL", tc.afeeds, tc.all, tc.new_all }
+        end
+        for _, l in ipairs(LIB.in_tab(t)) do
+            row[4] = row[4] + 1
+            local files = LIB.counts(l)
+            if files then row[5] = row[5] + files end
+            -- and deliberately not row[6]: "New" counts what the New row
+            -- would list, and that row is about feeds. A folder of songs you
+            -- have never played is not news.
+        end
+        out[i] = row
+    end
+    return out
 end
 
 -- URLs currently in mpv's playlist, so queued items can be marked as such.
@@ -2083,6 +2868,13 @@ local function prepare_thumb(url)
     -- The downloaded picture is kept, not just the converted one: resizing the
     -- window asks for a new pixel size, and re-fetching the image over the
     -- network for every size the drag passes through would be absurd.
+    -- A file on disk is already here: hand it straight to ffmpeg, which
+    -- finds either an attached picture or a first frame in it.
+    if not url:match("^https?://") then
+        convert(url)
+        return
+    end
+
     local src = utils.join_path(PLAT.temp_dir(),
         string.format("mpv-rss-img-%s", fnv1a(url)))
     if (file_size(src) or 0) > 0 then
@@ -2225,27 +3017,33 @@ rebuild_rows = function()
             end
         end
     elseif ui.view == "feeds" then
-        local all = entries_for_tab(ui.tab)
-        local fresh = new_count(all)
-        -- everything you have not started, across this tab, on top
-        -- count is the one-line form of detail, for the narrow layout, which
-        -- has no second line to put it on: new / total, newsraft style
-        rows[#rows + 1] = {
-            kind = "new",
-            label = "New",
-            detail = (fresh > 0)
-                and string.format("%d unplayed item%s", fresh, fresh == 1 and "" or "s")
-                or "nothing new",
-            count = tostring(fresh),
-        }
-        rows[#rows + 1] = {
-            kind = "all",
-            label = (ui.tab == "videos" and "All videos")
-                or (ui.tab == "podcasts" and "All episodes")
-                or "All items",
-            detail = string.format("%d items  ·  %d new", #all, new_count(all)),
-            count = string.format("%d / %d", fresh, #all),
-        }
+        -- New and All items are questions about feeds -- what has arrived
+        -- since I last looked -- so a tab that is only libraries does not ask
+        -- them, and goes straight to the folders.
+        if not LIB.only_tab(ui.tab) then
+            local all = entries_for_tab(ui.tab)
+            local fresh = new_count(all)
+            -- everything you have not started, across this tab, on top
+            -- count is the one-line form of detail, for the narrow layout,
+            -- which has no second line to put it on: new / total, newsraft
+            -- style
+            rows[#rows + 1] = {
+                kind = "new",
+                label = "New",
+                detail = (fresh > 0)
+                    and string.format("%d unplayed item%s", fresh, fresh == 1 and "" or "s")
+                    or "nothing new",
+                count = tostring(fresh),
+            }
+            rows[#rows + 1] = {
+                kind = "all",
+                label = (ui.tab == "videos" and "All videos")
+                    or (ui.tab == "podcasts" and "All episodes")
+                    or "All items",
+                detail = string.format("%d items  ·  %d new", #all, new_count(all)),
+                count = string.format("%d / %d", fresh, #all),
+            }
+        end
         for _, f in ipairs(feeds) do
           if feed_in_tab(f.url, ui.tab) then
             local list = entries_for_feed(f.url)
@@ -2268,6 +3066,58 @@ rebuild_rows = function()
             }
           end
         end
+        -- the local folders that belong to this tab, after the feeds
+        for _, l in ipairs(LIB.in_tab(ui.tab)) do
+            local files, fresh, folders = LIB.counts(l)
+            local detail, count
+            if files then
+                detail = LIB.summary(files, folders)
+                    .. string.format("  ·  %d new", fresh or 0)
+                count = string.format("%d / %d", fresh or 0, files)
+            elseif l.indexing then
+                detail, count = "reading the folder...", "..."
+            else
+                -- library_index=no: say where it is, since there is no count
+                detail, count = l.path, ICON.folder
+            end
+            rows[#rows + 1] = {
+                kind = "lib", lib = l, label = l.name, detail = detail,
+                count = count,
+                icon = (l.kind == "music" and ICON.music)
+                    or (l.kind == "audiobooks" and ICON.book) or ICON.folder,
+            }
+        end
+
+    elseif ui.view == "library" then
+        local def = ui.lib
+        local path = ui.lib_path or (def and def.path) or ""
+        local filter = ui.filter ~= "" and ui.filter:lower() or nil
+        if filter and def and def.index then
+            -- a filter in a library searches the index: everything under the
+            -- folder you are in, however deep, not just its own listing. The
+            -- row carries the path it was found at, since the name alone no
+            -- longer says where it is.
+            for _, e in ipairs(LIB.search(def, path, ui.filter)) do
+                rows[#rows + 1] = { kind = "entry", entry = e,
+                                    at = LIB.rel(def, e.url) }
+            end
+        else
+            local list = LIB.list(path, def)
+            for _, d in ipairs(list.dirs) do
+                if not filter or d.name:lower():find(filter, 1, true) then
+                    rows[#rows + 1] = { kind = "dir", path = d.path,
+                                        label = d.name, icon = ICON.folder }
+                end
+            end
+            for _, e in ipairs(list.files) do
+                if not filter or (e.title or ""):lower():find(filter, 1, true) then
+                    rows[#rows + 1] = { kind = "entry", entry = e }
+                end
+            end
+        end
+        -- hide_watched is deliberately not applied here: a library is a view
+        -- of a disk, and a file browser that hides files you have played
+        -- would be lying about what is in the folder.
     else
         local list = ui.entries
         local filter = ui.filter ~= "" and ui.filter:lower() or nil
@@ -2316,6 +3166,10 @@ render = function()
             local c = cache[sel_row.feed.url]
             art = (c and c.image)
                 or artwork_url(entries_for_feed(sel_row.feed.url)[1])
+        elseif sel_row.kind == "lib" or sel_row.kind == "dir" then
+            local def = sel_row.lib or ui.lib
+            local path = sel_row.path or (sel_row.lib and sel_row.lib.path)
+            art = path and artwork_url(LIB.first_file(def, path)) or nil
         elseif sel_row.kind == "new" or sel_row.kind == "all" then
             art = artwork_url(entries_for_tab(ui.tab)[1])
         end
@@ -2333,7 +3187,6 @@ render = function()
     -- heading, titles -- is laid out in what is left, which is as wide as it
     -- can be. (It used to take a whole third of the panel.)
     local inner_w = g.w - g.pad * 2 - (thumb_slot and (thumb_w + g.pad) or 0)
-    local col_w = math.floor(inner_w / 3)
     -- glyph widths are unknown to the script, so this is an estimate; the
     -- clip below is the hard guarantee that nothing escapes the panel
     local cols = math.max(16, math.floor(inner_w / (s.body * 0.5)))
@@ -2360,15 +3213,9 @@ render = function()
     -- Tab bar. Each tab gets its own column and its own ASS event, so the
     -- active one can be underlined at a known x -- with one shared text line
     -- the x of a tab is unknowable (the font is proportional).
-    local tc = tab_counts()
-    local tabs = {
-        { "all", ICON.all, "ALL", tc.afeeds, tc.all, tc.new_all },
-        { "videos", ICON.video, "VIDEOS", tc.vfeeds, tc.videos, tc.new_videos },
-        { "podcasts", ICON.podcast, "PODCASTS", tc.pfeeds, tc.podcasts, tc.new_podcasts },
-    }
+    local tabs = LIB.tabinfo()
     local fn = (UI_FONT ~= "") and ("\\fn" .. UI_FONT) or ""
     local tabx, taby = g.x + g.pad, g.y + g.pad
-    local colw = col_w
     local tab_out, underline = {}, nil
     local active_i = 1
     for i, t in ipairs(tabs) do if ui.tab == t[1] then active_i = i end end
@@ -2402,23 +3249,63 @@ render = function()
             taby + math.floor((s.heading - s.meta) / 2), s.meta,
             col("dark5") .. string.format("%s %d / %d", ICON.author, t[4], t[5]))
     else
+        -- Each tab takes the width of its own text rather than a column
+        -- apiece: libraries can make five of them, and five equal columns
+        -- leave each one too little for its counts while most of the row
+        -- stays empty. The width of a string is estimated from its length --
+        -- the font is proportional, so the figure is approximate and
+        -- deliberately generous.
+        local gap = math.floor(s.body * 1.1)
+        local function wide(text) return math.floor(utf8_len(text) * s.body * 0.5) end
+
+        -- Three parts per tab: the number and label, which always show; the
+        -- sources / items count; and the New badge. The last two are all or
+        -- nothing across the whole row, so the tabs stay comparable.
+        local part, need = {}, 0
+        for i, t in ipairs(tabs) do
+            part[i] = {
+                head = i .. "  " .. t[2] .. " " .. t[3],
+                cnt  = "   " .. ICON.author .. " " .. t[4] .. " / " .. t[5],
+                new  = (t[6] > 0) and ("   New " .. t[6]) or "",
+            }
+            need = need + wide(part[i].head) + gap
+        end
+        local extra_new, extra_cnt = 0, 0
+        for i = 1, #part do
+            extra_new = extra_new + wide(part[i].new)
+            extra_cnt = extra_cnt + wide(part[i].cnt)
+        end
+        -- Three tabs have always had room for all of it, and the estimate is
+        -- too rough to start second-guessing a layout that fits. Only the
+        -- extra tabs a library brings are measured.
+        local tight = #tabs > 3
+        local show_new = not tight or (need + extra_new) <= inner_w
+        local show_cnt = not tight
+            or (show_new and (need + extra_new + extra_cnt) <= inner_w)
+
+        local tx = tabx
         for i, t in ipairs(tabs) do
             local active = (i == active_i)
-            local tx = tabx + (i - 1) * colw
+            local p = part[i]
             -- the number is both a label and the key that selects the section
-            local text = (active and col("blue", true) or col("dark5"))
-                .. i .. "  " .. t[2] .. " " .. t[3]
-                .. "   " .. (active and col("fg") or col("dark5"))
-                .. ICON.author .. " " .. t[4] .. " / " .. t[5]
-            if t[6] > 0 then
-                text = text .. "   " .. col("purple") .. "New " .. t[6]
+            local text = (active and col("blue", true) or col("dark5")) .. p.head
+            local plain = p.head
+            if show_cnt then
+                text = text .. (active and col("fg") or col("dark5")) .. p.cnt
+                plain = plain .. p.cnt
+            end
+            if show_new and p.new ~= "" then
+                text = text .. col("purple") .. p.new
+                plain = plain .. p.new
             end
             tab_out[#tab_out + 1] = line(7, tx, taby, s.body, text)
             if active then
                 local uy = taby + s.body + math.floor(s.body * 0.22)
                 local uh = math.max(2, math.floor(s.body * 0.12))
-                underline = rule(tx, uy, math.floor(colw * 0.80), uh, "blue")
+                -- under the label itself, not under the counts behind it
+                underline = rule(tx, uy, wide(p.head), uh, "blue")
             end
+            tx = tx + wide(plain) + gap
         end
     end
 
@@ -2450,13 +3337,26 @@ render = function()
     local sel_e = sel_row and sel_row.entry or nil
     if sel_e then
         local bits = {}
-        if sel_e.author and sel_e.author ~= "" then
+        if sel_e.local_file then
+            -- where it is, rather than who made it: the folder it sits in,
+            -- named from its library down, which is also the breadcrumb
+            LIB.stat(sel_e)
+            local def = LIB.def_for(sel_e.url)
+            local dir = sel_e.url:match("^(.*)/[^/]*$") or ""
+            local where = (def and dir ~= def.path) and LIB.rel(def, dir) or ""
+            bits[#bits + 1] = ICON.folder .. " " .. ((def and def.name) or dir)
+                .. ((where ~= "") and (" / " .. where) or "")
+        elseif sel_e.author and sel_e.author ~= "" then
             bits[#bits + 1] = ICON.author .. " " .. sel_e.author
         elseif sel_row.kind == "pl" then
             bits[#bits + 1] = ICON.queued .. " playlist"
         end
         bits[#bits + 1] = format_date(sel_e.date, "long")
         if sel_e.duration then bits[#bits + 1] = format_clock(sel_e.duration) end
+        if sel_e.local_file then
+            local sz = LIB.human(sel_e.size)
+            if sz then bits[#bits + 1] = sz end
+        end
         l1 = table.concat(bits, "  ·  ")
         l2 = sel_e.title or "(untitled)"
 
@@ -2483,6 +3383,42 @@ render = function()
         local q = pl_urls[sel_e.url] or (sel_row.current and "current") or nil
         if q == "current" then tail, ctail = "  ·  now playing", "green"
         elseif q == "queued" then tail, ctail = "  ·  queued", "teal" end
+
+    elseif sel_row and (sel_row.kind == "lib" or sel_row.kind == "dir") then
+        local def = sel_row.lib or ui.lib
+        local kicon = (def and def.kind == "music" and ICON.music)
+            or (def and def.kind == "audiobooks" and ICON.book)
+            or (sel_row.kind == "dir" and ICON.folder) or ICON.video
+        c3 = "dark5"
+        if sel_row.kind == "lib" then
+            local files, fresh, folders = LIB.counts(def)
+            local bits = { kicon }
+            if files then
+                bits[#bits + 1] = LIB.summary(files, folders)
+                if fresh and fresh > 0 then
+                    bits[#bits + 1] = string.format("%d unplayed", fresh)
+                end
+                if def.capped then bits[#bits + 1] = "index full" end
+            elseif def.indexing then
+                bits[#bits + 1] = "reading the folder..."
+            else
+                bits[#bits + 1] = "not indexed"
+            end
+            l1 = table.concat(bits, "  ·  ")
+            l2 = def.name
+            l3 = def.path
+        else
+            -- a folder inside a library: its own listing is already cached by
+            -- the time it can be selected, so counting it costs nothing
+            local list = LIB.list(sel_row.path, def)
+            l1 = kicon .. " " .. ((def and def.name) or "")
+                .. "  /  " .. LIB.rel(def, sel_row.path)
+            l2 = sel_row.label or ""
+            l3 = LIB.summary(#list.files, #list.dirs)
+            if #list.files == 0 and #list.dirs == 0 then
+                l3 = "nothing playable in here"
+            end
+        end
 
     elseif sel_row and sel_row.feed then
         local f = sel_row.feed
@@ -2529,6 +3465,9 @@ render = function()
             title, ticon = "KEYBOARD SHORTCUTS", ICON.search
         elseif ui.view == "error" then
             title, ticon = "FEED ERROR", ICON.err
+        elseif ui.view == "library" then
+            title = (ui.lib and ui.lib.name or "LIBRARY")
+            ticon = ICON.folder
         else
             title, ticon = ui.feed_label or "", ICON.heading
         end
@@ -2584,6 +3523,13 @@ render = function()
                 { "m", "toggle seen / unseen" },
                 { "v", "hide / show watched items" },
             } },
+            { "Folders", {
+                { "Enter", "open a library or a folder" },
+                { "Esc  ←", "back up one folder" },
+                { opts.key_queue .. "  " .. opts.key_play_next, "queue a whole folder, in order" },
+                { "/", "search the whole library" },
+                { "r", "read the folder again" },
+            } },
             { "Feeds", {
                 { "r", "refresh this feed" },
                 { "R", "refresh everything" },
@@ -2629,9 +3575,19 @@ render = function()
             m1 = "The playlist is empty."
             m2 = string.format("Queue with  %s  (to the end)  or  %s  (play next).",
                 opts.key_queue, opts.key_play_next)
+        elseif ui.view == "library" then
+            m1 = (ui.filter ~= "") and "Nothing here matches that."
+                or "Nothing playable in this folder."
+            m2 = "Esc goes back up.  r reads the folder again."
         elseif ui.view == "feeds" then
-            m1 = "No feeds yet."
-            m2 = "Copy a channel or podcast URL to the clipboard, then press  a"
+            if LIB.only_tab(ui.tab) then
+                m1 = "No folder for this section."
+                m2 = string.format("Add one to rss-feeds.json under \"libraries\" -- %s opens it.",
+                    opts.key_edit)
+            else
+                m1 = "No feeds yet."
+                m2 = "Copy a channel or podcast URL to the clipboard, then press  a"
+            end
         elseif ui.filter ~= "" then
             m1, m2 = "Nothing matches the filter.", ""
         elseif ui.hide_seen and #ui.entries > 0 then
@@ -2687,8 +3643,14 @@ render = function()
                 -- item is in the header card for the row you are on.
                 local when = ""
                 if row.kind ~= "pl" and e then
+                    -- a file on disk has no date until somebody asks for one
+                    if e.local_file then LIB.stat(e) end
                     when = col("dark5") .. format_date(e.date) .. " | " .. col(tone)
                 end
+                -- a hit from an index search: say which folder it is in,
+                -- since the list is no longer one folder
+                local label2 = label
+                if row.at then label2 = row.at end
 
                 -- One event per line: never use {\r} here, it resets the style
                 -- and would discard both \fn and \fs for the rest of the line.
@@ -2696,16 +3658,19 @@ render = function()
                     text = (selected and (col("orange") .. ICON.select .. " ") or "   ")
                         .. col(tone) .. icon .. "  "
                         .. (num ~= "" and (col("dark5") .. num .. col(tone)) or "")
-                        .. when .. fit(label, when ~= "" and 18 or 8, s.list, full_w),
+                        .. when .. fit(label2, when ~= "" and 18 or 8, s.list, full_w),
                     size = s.list, indent = ind1, gap = gap,
                 })
             else
-                -- a feed row
+                -- a feed, a library or a folder: one line, with an icon it
+                -- can bring itself (libraries and folders do)
                 local kind = row.feed and feed_kind(row.feed.url) or "other"
-                local icon = (row.kind == "new" and ICON.unseen)
+                local icon = row.icon
+                    or (row.kind == "new" and ICON.unseen)
                     or (kind == "podcast" and ICON.podcast)
                     or (kind == "video" and ICON.video) or ICON.all
                 local tone = selected and "orange"
+                    or row.tone
                     or (row.kind == "new" and "purple") or "fg"
                 -- one line, with new / total on the right; the full detail is
                 -- in the header card for whichever feed you are on
@@ -2752,6 +3717,11 @@ render = function()
             and string.format("↑↓ Move   Enter Play   d Remove   %s Back", opts.key_index)
             or string.format("↑↓ Navigate     Enter Play     d Remove     %s/Esc Back     q Close",
                 opts.key_index)
+    elseif ui.view == "library" then
+        hint = narrow
+            and string.format("↑↓ Move   Enter Open   %s Queue   Esc Up", opts.key_queue)
+            or string.format("%s Search   ↑↓ Navigate   Enter Open / Play   %s Queue folder   r Re-read   Esc Up",
+                ICON.search, opts.key_queue)
     elseif ui.view == "feeds" then
         hint = narrow
             and "1-3 / Tab Section   ↑↓ Move   Enter Open   a Add   q Close"
@@ -2864,9 +3834,11 @@ local close_menu   -- forward declaration
 -- live: a broadcast rather than a recording. Its duration grows as it is
 -- received and the position trails just behind, so neither number measures
 -- how much of the programme you have seen. See sample_progress below.
-local track = { id = nil, pos = 0, dur = nil, title = nil, live = false }
-
-local last_autosave = 0
+-- autosave holds the clock of the last progress write; it lives here rather
+-- than in a local of its own because the main chunk is at LuaJIT's ceiling of
+-- 200 locals (see PLAT in section 2).
+local track = { id = nil, pos = 0, dur = nil, title = nil, live = false,
+                autosave = 0 }
 
 local function sample_progress()
     if not track.id then return end
@@ -2886,9 +3858,9 @@ local function sample_progress()
     -- periodically commit the position, so an abrupt exit costs at most
     -- autosave_interval seconds of progress rather than the whole session
     local iv = tonumber(opts.autosave_interval) or 0
-    if iv > 0 and os.time() - last_autosave >= iv
+    if iv > 0 and os.time() - track.autosave >= iv
         and track.pos >= opts.min_progress_seconds then
-        last_autosave = os.time()
+        track.autosave = os.time()
         local p = state.progress[track.id] or {}
         if not p.done then
             p.pos, p.dur, p.ts = track.pos, track.dur or p.dur, os.time()
@@ -2934,6 +3906,7 @@ local function finish_tracking(completed)
         p.pos = (track.pos >= opts.min_progress_seconds) and track.pos or 0
     end
     state.progress[track.id] = p
+    LIB.rev = LIB.rev + 1              -- the library counters are cached
     save_state()
     track.id, track.pos, track.dur, track.title = nil, 0, nil, nil
     if ui.active then rebuild_rows() render() end
@@ -3099,18 +4072,16 @@ end)
 -- so the next video would sit frozen on frame 0. Remember the park and clear
 -- it when something new starts. Only mpv's own end-of-file pause is cleared --
 -- a pause you set yourself is left alone.
-local parked_at_eof = false
-
 mp.observe_property("eof-reached", "bool", function(_, v)
-    if v then parked_at_eof = true end
+    if v then fallback.parked = true end
 end)
 
 -- Playing something new from the browser should start it, not hold a frame
 -- from the file that just ended.
 mp.register_event("start-file", function()
     fallback.opened = mp.get_property("path")
-    if parked_at_eof then
-        parked_at_eof = false
+    if fallback.parked then
+        fallback.parked = false
         mp.set_property_bool("pause", false)
     end
     if ui.active then mp.set_property("keep-open", "yes") end
@@ -3124,6 +4095,11 @@ end)
 
 local function playable(e)
     if not e then return false end
+    if e.local_file then
+        if utils.file_info(e.url) then return true end
+        status("RSS: that file is no longer on the disk", 5, "red")
+        return false
+    end
     if not e.url or not is_valid_url(e.url) then
         status("RSS: item has no usable URL", 5, "red")
         return false
@@ -3162,8 +4138,9 @@ end
 -- Spotify-style queueing: "queue" appends to the end of the playlist,
 -- "next" inserts directly after the current item. Neither interrupts what is
 -- playing, and the browser stays open so several items can be added in a row.
-local function queue_entry(e, mode)
-    if not playable(e) then return end
+-- quiet: one of many, so the caller says what happened and redraws once
+local function queue_entry(e, mode, quiet)
+    if not playable(e) then return false end
     local idle = mp.get_property_bool("idle-active")
     -- Sitting on the last frame is not the same as idle-active: the finished
     -- file is still loaded, so mpv does not consider itself idle.
@@ -3181,6 +4158,7 @@ local function queue_entry(e, mode)
     -- hand; what was just added is what comes next. (start-file lifts the
     -- end-of-file pause that goes with the park.)
     if parked then mp.commandv("playlist-next") end
+    if quiet then return true end
     local n = mp.get_property_number("playlist-count") or 0
     -- playing next is a playback action (orange); adding to the queue uses the
     -- same teal a queued row does
@@ -3190,6 +4168,7 @@ local function queue_entry(e, mode)
         mode == "next" and "orange" or "teal")
     rebuild_rows()
     render()
+    return true
 end
 
 --==========================================================================
@@ -3355,12 +4334,10 @@ local function reload_feeds_full()
     render()
 end
 
-local editor_watch = nil
-
 local function stop_editor_watch()
-    if editor_watch then
-        editor_watch:kill()
-        editor_watch = nil
+    if ui.editor_watch then
+        ui.editor_watch:kill()
+        ui.editor_watch = nil
     end
 end
 
@@ -3370,7 +4347,7 @@ local function watch_feeds_file()
     stop_editor_watch()
     local before = file_read(PATHS.feeds)
     local deadline = os.time() + 900
-    editor_watch = mp.add_periodic_timer(2, function()
+    ui.editor_watch = mp.add_periodic_timer(2, function()
         local current = file_read(PATHS.feeds)
         if current and current ~= before then
             stop_editor_watch()
@@ -3385,7 +4362,9 @@ end
 
 local function open_feeds_in_editor()
     local path = PATHS.feeds
-    if not file_read(path) then write_json(path, { feeds = {} }) end
+    if not file_read(path) then
+        write_json(path, { feeds = {}, libraries = LIB.raw or {} }, true)
+    end
 
     local function launch(args, on_fail)
         mp.command_native_async({
@@ -3531,9 +4510,7 @@ local function open_help_view()
     render()
 end
 
-local TABS = { "all", "videos", "podcasts" }
-
--- A number cycles (Tab / Shift+Tab); a tab name goes straight there (keys 1-3).
+-- A number cycles (Tab / Shift+Tab); a tab name goes straight there (keys 1-5).
 local function switch_tab(delta)
     local i = 1
     for n, t in ipairs(TABS) do if t == ui.tab then i = n break end end
@@ -3542,8 +4519,9 @@ local function switch_tab(delta)
     else
         i = ((i - 1 + delta) % #TABS) + 1
     end
-    ui.tab = TABS[i]
+    ui.tab = TABS[i] or "all"
     ui.view = "feeds"          -- a tab switch always lands on its feed list
+    ui.lib, ui.lib_path, ui.lib_stack = nil, nil, {}
     ui.sel, ui.scroll, ui.filter = 1, 0, ""
     ui.prev_view = nil
     rebuild_rows()
@@ -3566,6 +4544,45 @@ local function open_new_view()
     ui.entries = out
     ui.view = "entries"
     ui.sel, ui.scroll, ui.filter = 1, 0, ""
+    rebuild_rows()
+    render()
+end
+
+-- A library opens in a view of its own: folders, a level at a time. The stack
+-- is what Esc walks back up, and it remembers where the cursor was on each
+-- level, so coming out of an album lands on the album rather than at the top
+-- of the list.
+local function open_library(def, path, descend)
+    if not def then return end
+    if descend and ui.view == "library" then
+        ui.lib_stack[#ui.lib_stack + 1] =
+            { path = ui.lib_path, sel = ui.sel, scroll = ui.scroll }
+    elseif not descend then
+        ui.lib_stack = {}
+    end
+    ui.lib = def
+    ui.lib_path = path or def.path
+    ui.view = "library"
+    ui.feed_url, ui.only_new, ui.feed_label = nil, false, def.name
+    ui.sel, ui.scroll, ui.filter = 1, 0, ""
+    -- so that "/" has a whole library to search rather than one folder
+    LIB.index(def)
+    rebuild_rows()
+    render()
+end
+
+local function library_up()
+    local top = table.remove(ui.lib_stack)
+    if not top then
+        -- at the root of the library: out to the list it was opened from
+        ui.view = "feeds"
+        ui.sel, ui.scroll, ui.filter = 1, 0, ""
+        rebuild_rows()
+        render()
+        return
+    end
+    ui.lib_path = top.path
+    ui.sel, ui.scroll, ui.filter = top.sel or 1, top.scroll or 0, ""
     rebuild_rows()
     render()
 end
@@ -3644,6 +4661,10 @@ local function activate()
     end
     if row.kind == "new" then
         open_new_view()
+    elseif row.kind == "lib" then
+        open_library(row.lib, nil, false)
+    elseif row.kind == "dir" then
+        open_library(ui.lib, row.path, true)
     elseif row.kind == "all" then
         open_feed_view(nil)
     elseif row.kind == "feed" then
@@ -3672,6 +4693,18 @@ local function back()
     end
     if ui.view == "playlist" or ui.view == "help" or ui.view == "error" then
         leave_playlist_view()      -- restores whatever view we came from
+        return
+    end
+    if ui.view == "library" then
+        -- a filter first: it is a view of this folder, and clearing it is not
+        -- the same as leaving
+        if ui.filter ~= "" then
+            ui.filter = ""
+            rebuild_rows()
+            render()
+            return
+        end
+        library_up()
         return
     end
     if ui.view == "entries" then
@@ -3710,6 +4743,37 @@ local function unbind(list)
     for i = #list, 1, -1 do list[i] = nil end
 end
 
+-- p and n on a folder, or on a library, take everything under it: an album,
+-- a book in chapters, a season. In order, which for an audiobook is the whole
+-- point -- and "play next" therefore inserts back to front, so that the first
+-- chapter is the one that plays next.
+local function queue_folder(row, mode)
+    local def = row.lib or ui.lib
+    local path = row.path or (row.lib and row.lib.path)
+    if not def or not path then return end
+    local files = LIB.files_under(def, path)
+    if #files == 0 then
+        status("RSS: nothing playable in there", 3)
+        return
+    end
+    local order = files
+    if mode == "next" then
+        order = {}
+        for i = #files, 1, -1 do order[#order + 1] = files[i] end
+    end
+    local n = 0
+    for _, e in ipairs(order) do
+        if queue_entry(e, mode, true) then n = n + 1 end
+    end
+    local total = mp.get_property_number("playlist-count") or 0
+    status(string.format("RSS: %s · %d file%s from %s   [playlist: %d]",
+        mode == "next" and "play next" or "queued", n, n == 1 and "" or "s",
+        utf8_truncate(row.label or def.name, 34), total), 5,
+        mode == "next" and "orange" or "teal")
+    rebuild_rows()
+    render()
+end
+
 -- m marks one item, or -- on a feed or on the "all" row -- the whole lot.
 -- Pressing it again on a fully watched feed makes it new again.
 local function toggle_watched()
@@ -3731,6 +4795,11 @@ local function toggle_watched()
         list, label = entries_for_feed(row.feed.url), row.feed.name
     elseif row.kind == "all" or row.kind == "new" then
         list, label = entries_for_tab(ui.tab), row.label
+    elseif row.kind == "lib" or row.kind == "dir" then
+        local def = row.lib or ui.lib
+        local path = row.path or (row.lib and row.lib.path)
+        list = (def and path) and LIB.files_under(def, path) or {}
+        label = row.label
     else
         return
     end
@@ -3741,6 +4810,7 @@ local function toggle_watched()
 
     local mark = new_count(list) > 0   -- anything still new -> mark the lot watched
     for _, e in ipairs(list) do set_watched(e.id, mark) end
+    LIB.rev = LIB.rev + 1              -- the library counters are cached
     save_state()
     status(string.format("%s · %s  (%d items)", label,
         mark and "feed watched" or "new", #list), 4,
@@ -3754,9 +4824,24 @@ local function refresh_current()
         if ui.error_feed then refresh_feeds({ ui.error_feed }) end
         return
     end
+    -- in a library, refreshing means reading the disk again: a file copied in
+    -- since the browser opened is not in the listing or in the index
+    if ui.view == "library" and ui.lib then
+        LIB.index(ui.lib, true)
+        status("RSS: reading " .. ui.lib.name .. " again", 3, "blue")
+        rebuild_rows()
+        render()
+        return
+    end
     if ui.view == "feeds" then
         local row = current_row()
-        if row and row.kind == "feed" then refresh_feeds({ row.feed }) else refresh_all() end
+        if row and row.kind == "lib" then
+            LIB.index(row.lib, true)
+            status("RSS: reading " .. row.lib.name .. " again", 3, "blue")
+            rebuild_rows()
+            render()
+        elseif row and row.kind == "feed" then refresh_feeds({ row.feed })
+        else refresh_all() end
     else
         if ui.feed_url then
             local f = feed_by_url(ui.feed_url)
@@ -3875,9 +4960,15 @@ unregister_input_bindings = function()
 end
 
 local function start_filter()
-    if ui.view ~= "entries" then return end
+    if ui.view ~= "entries" and ui.view ~= "library" then return end
+    -- in a library the index is what gets searched, so say so: the answer
+    -- covers everything under this folder, not only its own listing
+    local label = "Filter"
+    if ui.view == "library" then
+        label = (ui.lib and ui.lib.index) and "Search this library" or "Filter"
+    end
     start_input({
-        label = "Filter", icon = ICON.search, initial = ui.filter,
+        label = label, icon = ICON.search, initial = ui.filter,
         on_change = function(s) ui.filter = s end,
     })
 end
@@ -3940,22 +5031,36 @@ register_menu_bindings = function()
     bind(menu_binding_names, opts.key_edit, "editfeeds", guarded(open_feeds_in_editor))
 
     -- Spotify-style queueing, plus index numbers.
-    local function on_entry(fn, complaint)
+    -- A folder or a library under the cursor queues everything in it, so the
+    -- same two keys mean "add this" whatever "this" happens to be.
+    local function on_entry(mode, complaint)
         return guarded(function()
             local row = current_row()
-            if row and row.kind == "entry" then fn(row.entry) else status(complaint) end
+            if row and row.kind == "entry" then
+                queue_entry(row.entry, mode)
+            elseif row and (row.kind == "dir" or row.kind == "lib") then
+                queue_folder(row, mode)
+            else
+                status(complaint)
+            end
         end)
     end
     bind(menu_binding_names, opts.key_queue, "queue",
-        on_entry(function(e) queue_entry(e, "append") end, "RSS: select a video to queue"))
+        on_entry("append", "RSS: select an item or a folder to queue"))
     bind(menu_binding_names, opts.key_play_next, "playnext",
-        on_entry(function(e) queue_entry(e, "next") end, "RSS: select a video to play next"))
+        on_entry("next", "RSS: select an item or a folder to play next"))
     -- the playlist/queue view, numbered
     bind(menu_binding_names, opts.key_index, "index", guarded(function()
         if ui.view == "playlist" then leave_playlist_view() else open_playlist_view() end
     end))
     bind(menu_binding_names, "/", "slash", guarded(start_filter))
     bind(menu_binding_names, "v", "hideseen", guarded(function()
+        -- a library shows what is in the folder, whatever this is set to, so
+        -- say that rather than claiming to have hidden something
+        if ui.view == "library" then
+            status("RSS: a folder always shows every file in it", 4, "cyan")
+            return
+        end
         ui.hide_seen = not ui.hide_seen
         ui.sel, ui.scroll = 1, 0
         rebuild_rows()
@@ -3993,18 +5098,17 @@ local function on_osd_dimensions()
 end
 
 -- mpv's own keep-open, borrowed for as long as the browser is on screen.
-local saved_keep_open = nil
-
+-- Parked on ui rather than in a local of its own: see track.autosave.
 local function hold_last_frame(enable)
     if not opts.keep_open_in_menu then return end
     if enable then
-        if saved_keep_open == nil then
-            saved_keep_open = mp.get_property("keep-open") or "no"
+        if ui.keep_open_saved == nil then
+            ui.keep_open_saved = mp.get_property("keep-open") or "no"
         end
         mp.set_property("keep-open", "yes")
-    elseif saved_keep_open ~= nil then
-        mp.set_property("keep-open", saved_keep_open)
-        saved_keep_open = nil
+    elseif ui.keep_open_saved ~= nil then
+        mp.set_property("keep-open", ui.keep_open_saved)
+        ui.keep_open_saved = nil
     end
 end
 
@@ -4019,8 +5123,13 @@ local function open_menu()
     -- keep the panel undistorted when the window is resized
     mp.observe_property("osd-dimensions", "native", on_osd_dimensions)
     reload_feeds()   -- adopt feeds added to the file while mpv was running
+    -- the library behind the tab you were on can have been removed from the
+    -- file, or its disk simply not be here this time
+    if not LIB.known_tab(ui.tab) then ui.tab = "all" end
+    ui.lib, ui.lib_path, ui.lib_stack = nil, nil, {}
     rebuild_rows()
     render()
+    LIB.index_all()  -- in the background, a few directories per tick
     if opts.refresh_on_open then refresh_stale() end
 end
 
@@ -4140,5 +5249,5 @@ if opts.auto_open then
     end)
 end
 
-msg.verbose(string.format("%s ready (feeds=%s cache=%s state=%s)",
-    SCRIPT_NAME, PATHS.feeds, PATHS.cache, PATHS.state))
+msg.verbose(string.format("rss ready (feeds=%s cache=%s state=%s)",
+    PATHS.feeds, PATHS.cache, PATHS.state))

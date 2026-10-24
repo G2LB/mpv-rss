@@ -29,6 +29,10 @@ The header is a **card about the row you are on** — channel, date, duration,
 title, and where you left off — so the list itself needs only one line per
 item and twice as many fit on screen.
 
+It also browses **folders on your own disk** — Videos, Music, Audiobooks — in
+the same panel, with the same keys, and remembers where you got to in a file
+exactly as it does for a feed. See [§6](#6-local-folders--videos-music-audiobooks).
+
 ---
 
 ## 1. Requirements
@@ -126,7 +130,7 @@ cp script-opts/rss.conf ~/.config/mpv/script-opts/
 ```
 
 Everything in it is commented out, so it changes nothing until you edit it.
-See [§8](#8-configuration).
+See [§9](#9-configuration).
 
 ### 2.4 Install yt-dlp
 
@@ -211,28 +215,28 @@ it. Nothing else is needed.
 | Key | Action |
 |---|---|
 | <kbd>Ctrl</kbd>+<kbd>R</kbd> | open / close the browser |
-| <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> | next / previous section: Alles / Videos / Podcasts |
-| <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> | go straight to Alles / Videos / Podcasts |
+| <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> | next / previous section: Alles / Videos / Podcasts, plus Music / Audiobooks when you have those folders |
+| <kbd>1</kbd> … <kbd>5</kbd> | go straight to one section |
 | <kbd>↑</kbd> <kbd>↓</kbd> or <kbd>k</kbd> <kbd>j</kbd> | navigate |
 | <kbd>PgUp</kbd> <kbd>PgDn</kbd> <kbd>Home</kbd> <kbd>End</kbd> | page / jump |
-| <kbd>Enter</kbd> or <kbd>→</kbd> | open feed / play video now |
-| <kbd>p</kbd> | **add to the playlist** (at the end) — like "add to queue" |
-| <kbd>n</kbd> | **play next** — insert right after the current video |
+| <kbd>Enter</kbd> or <kbd>→</kbd> | open feed or folder / play video now |
+| <kbd>p</kbd> | **add to the playlist** (at the end) — like "add to queue". On a folder: everything in it, in order |
+| <kbd>n</kbd> | **play next** — insert right after the current video. On a folder: the whole folder next |
 | <kbd>i</kbd> | show the **playlist**, numbered |
-| <kbd>Esc</kbd> <kbd>←</kbd> <kbd>Backspace</kbd> | back (videos → feeds → close) |
+| <kbd>Esc</kbd> <kbd>←</kbd> <kbd>Backspace</kbd> | back (videos → feeds → close; in a folder, one level up) |
 | <kbd>q</kbd> | close the browser — **does not quit mpv** |
-| <kbd>r</kbd> | refresh (the selected feed, or all from the feed list) |
+| <kbd>r</kbd> | refresh (the selected feed, or all from the feed list; in a library, re-read the disk) |
 | <kbd>R</kbd> | refresh everything |
 | <kbd>m</kbd> | toggle seen / unseen |
 | <kbd>v</kbd> | hide / show watched items |
 | <kbd>a</kbd> | add the feed URL on the clipboard |
 | <kbd>d</kbd> then <kbd>y</kbd> | remove the selected feed |
-| <kbd>/</kbd> | filter the current list |
+| <kbd>/</kbd> | filter the current list — in a library, search everything under the folder you are in |
 | <kbd>e</kbd> | show the full error of a failed feed |
 | <kbd>?</kbd> | keyboard shortcuts, on screen |
 
-<kbd>?</kbd> shows all of this inside mpv, grouped by Navigate / Play / Feeds /
-Other, so you never need this table while using it.
+<kbd>?</kbd> shows all of this inside mpv, grouped by Navigate / Play /
+Folders / Feeds / Other, so you never need this table while using it.
 
 Because of that there is **no permanent hint bar** along the bottom — the panel
 shows content and nothing else. The bottom row still appears when it has
@@ -348,6 +352,15 @@ to make the whole thing new again.
 goes back), and <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> jump straight to one.
 Neither Tab key is bound by mpv itself; the digits are, so they are taken over
 only while the browser is open.
+
+**The tab bar is as long as your sources make it.** A local Music folder adds a
+**MUSIC** tab and an Audiobooks folder an **AUDIOBOOKS** tab — <kbd>4</kbd> and
+<kbd>5</kbd> — while a local video folder joins **VIDEOS**, next to the
+channels. Tabs with nothing behind them never appear, so a machine without
+those folders shows the same three sections it always did. The columns share
+the width evenly, and the per-tab counts are dropped when the columns get too
+narrow for them; the number, the label and the New badge always survive.
+[§6](#6-local-folders--videos-music-audiobooks) covers the folders themselves.
 
 A feed's type is detected from its own entries: YouTube items or a video
 enclosure make it a **video** feed, an audio enclosure or Podcasting 2.0 markup
@@ -649,7 +662,212 @@ tolerated. Restart mpv to pick up hand-made changes.
 
 ---
 
-## 6. Playing, refreshing, removing
+## 6. Local folders — Videos, Music, Audiobooks
+
+Subscriptions are not the only thing worth a tab. A **library** is a folder on
+your own disk, browsed as a tree in the same panel, with the same keys, and
+with the same memory of where you stopped in a file.
+
+```
+┌───────────────────────────────────────────────────────────────┬────────┐
+│ 1 ALL      2 VIDEOS      3 PODCASTS      4 MUSIC      5 AUDIOBOOKS     │
+│                                                 ──────────────┤ cover  │
+│ 󰉋 Audiobooks / Ancient_Recitations · 2026-09-21 · 24 MB       │ image  │
+│ 01 The prologue of Gilgamesh                                  └────────┤
+│ ◐ started · resume 04:12 of 21:40 (19%)                                │
+│ ───────────────────────────────────────────────────────────────────────│
+│ ▶ ● Sep 21 | 01 The prologue of Gilgamesh                              │
+│   ✓ Sep 21 | 02 Gilgamesh and Enkidu                                   │
+│   ● Sep 21 | 03 The journey to the cedar forest                        │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+Nothing is fetched and nothing is scanned up front: a folder is read when you
+walk into it, so pointing this at a disk with 50 000 files costs nothing until
+you look inside.
+
+### 6.1 Declaring them
+
+They live in `rss-feeds.json`, beside the feeds, under a `libraries` key:
+
+```jsonc
+{
+  "feeds": [
+    {"name": "Historia Civilis", "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCv_vLHiWVBh_FR9vbeuiY-A"}
+  ],
+  "libraries": [
+    {"name": "Videos",     "path": "C:/Users/Luke/Videos",     "kind": "videos"},
+    {"name": "Music",      "path": "C:/Users/Luke/Music",      "kind": "music"},
+    {"name": "Audiobooks", "path": "C:/Users/Luke/Audiobooks", "kind": "audiobooks"}
+  ]
+}
+```
+
+<kbd>Alt</kbd>+<kbd>A</kbd> opens that file in an editor and reloads it the
+moment you save — the same route as editing feeds.
+
+**You do not have to write it yourself.** On first run — or the first run after
+updating a script that predates libraries — the three standard folders for your
+platform are written into the file for you:
+
+| Platform | Folders offered |
+|---|---|
+| Windows | `%USERPROFILE%\Videos`, `\Music`, `\Audiobooks` |
+| Linux, macOS, BSD | `~/Videos`, `~/Music`, `~/Audiobooks` |
+
+Whatever exists shows up; whatever does not is ignored. On a typical Windows
+machine that means Videos and Music work immediately and Audiobooks starts
+working the day you create the folder.
+
+Each entry takes:
+
+| Field | Meaning |
+|---|---|
+| `path` | the folder. Forward or backward slashes, `~/` understood, UNC paths (`//nas/media`) fine. **Required** |
+| `name` | what the row is called. Defaults to the last part of the path |
+| `kind` | `videos`, `music` or `audiobooks` — which tab it lands in. Guessed from the name when left out |
+| `enabled` | `false` switches it off without deleting it |
+| `sort` | `name`, `date` or `size`, for this library only. Defaults to `library_sort` |
+
+A bare string is shorthand for `{"path": "…"}`:
+
+```jsonc
+"libraries": ["D:/Films", "//nas/media/Music"]
+```
+
+`kind` is guessed from the name and the path when you leave it out: anything
+that looks like music or an audiobook — in English, Dutch or German — lands in
+that tab, and everything else is treated as video.
+
+### 6.2 Switching one off
+
+Three ways, and a library is left out silently by all of them:
+
+```jsonc
+"libraries": [
+  {"name": "Music", "path": "C:/Users/Luke/Music", "kind": "music"},
+  {"name": "Films", "path": "D:/Films", "enabled": false},   // switched off
+  // {"name": "NAS", "path": "//nas/media"},                 // commented out
+  {"name": "Work laptop only", "path": "E:/Media"}           // E: is not here
+]
+```
+
+1. `"enabled": false`.
+2. **A comment.** `rss-feeds.json` is read as JSON *with comments* — `//` to
+   end of line, `/* … */`, and a comma left dangling in front of a `}` or `]`
+   once you have commented out the last entry. Strict JSON allows none of
+   that, and mpv's parser rejects a file outright for it, so this is handled
+   before the file is parsed. `https://` and `//nas/share` are safe: text
+   inside quotes is never treated as a comment.
+3. **The folder is not on this machine.** No error, no empty tab — which is
+   what makes one `rss-feeds.json` carryable between a desktop and a laptop
+   that do not have the same disks.
+
+A name that starts with `//`, `#`, `;` or `--` counts as commented out too, for
+switching one off without restructuring the file.
+
+> **Comments do not survive a rewrite.** Adding a feed with <kbd>a</kbd> or
+> removing one with <kbd>d</kbd> rewrites the file from what was parsed, and a
+> parser does not keep comments. Everything else survives exactly as it was —
+> including entries that are disabled and entries for folders this machine does
+> not have — so prefer `"enabled": false` for anything you want to keep.
+
+A file that is there but **does not parse** is now left strictly alone: the
+feeds and libraries already loaded stay loaded, nothing is written over it, and
+the error says so. Before, one stray comma cost you the file.
+
+### 6.3 Browsing
+
+A library is a row in its tab, under the feeds. <kbd>Enter</kbd> walks in,
+<kbd>Esc</kbd> walks back out one level at a time, and coming out of a folder
+puts the cursor back on it rather than at the top of the list.
+
+* Folders sort by name, and **numerically where the name is numbered** — `Track 2`
+  before `Track 10`, which is the whole reason a music folder is named that way.
+* Files sort by `library_sort`: `name` (default), `date` or `size`.
+* Only playable files get a row. The built-in list covers the usual video and
+  audio extensions, `m4b` included; `library_extensions=…` adds more.
+* `Wim_Hof_Method_[abc123].mp4` is shown as **Wim Hof Method** — underscores
+  become spaces and the id yt-dlp appends is dropped. `library_clean_names=no`
+  leaves filenames exactly as they are.
+* Hidden files, dotfiles and Windows' `desktop.ini` are skipped unless
+  `library_hidden=yes`.
+
+**Watch state works exactly as it does for a feed.** A file you have started is
+marked `◐` and resumes where you left it; one you have finished is `✓`. The
+state is keyed on the path, so moving a file loses its place — nothing else
+does.
+
+The preview works too, with no network involved: ffmpeg lifts the **cover art**
+out of an album track and the **first frame** out of a video.
+
+### 6.4 The index
+
+While you browse, each library is walked in the background — a handful of
+directories per tick, so a slow disk cannot stall mpv — to build a flat list of
+everything under it. That index is what gives you:
+
+* **<kbd>/</kbd> searches the whole library**, not the folder you happen to be
+  standing in. Results show the path they were found at. It matches folder
+  names as well as filenames, so searching for a performer finds their folder.
+* **Counts**: `0 / 244` on the library row, and the totals in the tab bar.
+* **<kbd>p</kbd> and <kbd>n</kbd> on a folder** reaching into its subfolders.
+
+`library_max` caps it (20 000 files) and `library_depth` limits how deep it
+goes (8 levels). A capped library says *index full* in the header card and
+still browses normally. `library_index=no` turns the walk off altogether:
+browsing still works folder by folder, and <kbd>/</kbd> then filters just the
+listing in front of you.
+
+<kbd>r</kbd> re-reads a library from the disk — both the listings and the index
+— which is how a file copied in while mpv was running shows up.
+
+### 6.5 Queueing a whole folder
+
+<kbd>p</kbd> on a folder or on a library queues **everything under it, in
+order**. <kbd>n</kbd> does the same as *play next*, inserted so that the first
+file is the one that plays next — an audiobook in chapters, an album with its
+discs in subfolders, a season of something, all with one key. The browser stays
+open and the footer reports what went in:
+
+```
+RSS: queued · 14 files from Wim_Hof   [playlist: 15]
+```
+
+<kbd>m</kbd> on a folder marks everything under it watched, or unwatched again
+if it already was.
+
+### 6.6 What a library deliberately does not do
+
+**It does not feed New or All items.** Those two rows answer *what has arrived
+since I last looked*, which is a question about a feed. A folder of 4 000 songs
+has no answer to it and would drown the one the feeds gave, so a library-only
+tab (MUSIC, AUDIOBOOKS) skips both rows and lists its folders instead, and the
+`New` badge in the tab bar stays about feeds.
+
+**It does not hide watched files.** `hide_watched` is off in a library however
+it is set elsewhere: a file browser that hides files you have played would be
+lying about what is in the folder. The markers still tell you which is which.
+
+**It never writes to your media folders.** Libraries are read-only; the only
+thing on disk that changes is `rss-state.json`, which remembers positions.
+
+### 6.7 Options
+
+| Option | Default | |
+|---|---|---|
+| `libraries` | `yes` | `no` ignores the `libraries` key entirely |
+| `library_sort` | `name` | `name`, `date` or `size`. Folders are always by name |
+| `library_index` | `yes` | the background walk. `no` = browse only, no search, no counts |
+| `library_depth` | `8` | how deep that walk goes |
+| `library_max` | `20000` | and how many files it keeps |
+| `library_hidden` | `no` | include dotfiles and hidden folders |
+| `library_clean_names` | `yes` | `Wim_Hof_[abc].mp4` → `Wim Hof` |
+| `library_extensions` | *(empty)* | extra playable extensions, comma separated, no dots |
+
+---
+
+## 7. Playing, refreshing, removing
 
 **Play** — select a video, press <kbd>Enter</kbd>. The URL is handed to mpv
 (`loadfile`), which resolves it with yt-dlp. Nothing is downloaded to disk
@@ -676,7 +894,7 @@ already-downloaded entries — no network, no YouTube search.
 
 ---
 
-## 7. Files it writes
+## 8. Files it writes
 
 All inside your mpv config folder; nothing is ever written to the mpv
 installation directory.
@@ -686,7 +904,7 @@ and `~/.config/mpv/` elsewhere ([§2.1](#21-mpvs-config-directory)).
 
 | File | Contents |
 |---|---|
-| `<config>/rss-feeds.json` | your subscriptions |
+| `<config>/rss-feeds.json` | your subscriptions, and your local folders ([§6](#6-local-folders--videos-music-audiobooks)) |
 | `<config>/rss-cache.json` | downloaded entries, so navigation needs no network |
 | `<config>/rss-state.json` | watch state and resume positions, by video ID |
 
@@ -709,11 +927,17 @@ press <kbd>R</kbd>, so a feed you add in the file is adopted — reported as
 *"picked up N new feeds"* — instead of being overwritten by the copy in memory.
 Your cache and watch state are untouched by this; adding a feed never costs you
 anything you had already. Feeds you remove with <kbd>d</kbd> stay removed and
-are not resurrected by the merge.
+are not resurrected by the merge. A library added, renamed or commented out in
+the file is picked up on the next open as well.
+
+It is **written back indented**, one feed or library per line, because it is a
+file people open. It takes `//` and `/* … */` comments and a trailing comma
+(see [§6.2](#62-switching-one-off)), and a file that does not parse is left
+alone rather than replaced.
 
 ---
 
-## 8. Configuration
+## 9. Configuration
 
 `<config>/script-opts/rss.conf`, one `key=value` per line. The shipped
 file lists every option with its default, all commented out. The ones you are
@@ -735,6 +959,12 @@ osd_height=720           # virtual canvas; the UI scales to any window size
 narrow_layout=auto       # single-column layout in a small window (see §4)
 narrow_width=960         # ...at or below this window width in px
 narrow_ratio=0.6         # ...or this fraction of the display width
+libraries=yes            # local folders (see §6); no = ignore them
+library_sort=name        # name | date | size, inside a library
+library_index=yes        # background walk: / searches it all, and the counts
+library_depth=8          # how deep that walk goes
+library_max=20000        # and how many files it keeps
+library_clean_names=yes  # "Wim_Hof_[abc].mp4" -> "Wim Hof"
 feeds_file=              # empty = <mpv config dir>\rss-feeds.json
 cache_file=
 state_file=
@@ -752,7 +982,7 @@ mpv --script-opts=rss-font_size=12,rss-date_format=relative
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 **Nothing happens when I run `mpv`** — mpv with no file exits immediately.
 Use `mpv-rss.cmd` / `mpv-rss.sh`, or add `idle=yes` and `force-window=immediate`
@@ -813,7 +1043,7 @@ directory. They are rebuilt on the next refresh.
 
 ---
 
-## 10. Notes on behaviour
+## 11. Notes on behaviour
 
 **Security.** Feed content is treated as untrusted: nothing from a feed is ever
 executed or evaluated, URLs are validated as `http(s)` before being handed to
